@@ -763,10 +763,117 @@ static void draw_cat_pupil(int cx, int cy, int h, int w, uint16_t col)
 static int16_t sclera_x0[LCD_H];  // first sclera pixel on row
 static int16_t sclera_x1[LCD_H];  // last sclera pixel on row (inclusive), -1 if none
 
+// Sphere shading LUT: pre-blended sclera colors indexed by dist_sq >> 5
+#define SCLERA_R       195
+#define SCLERA_R2      (SCLERA_R * SCLERA_R)
+#define SHADE_SHIFT    5
+#define SHADE_LUT_SIZE ((SCLERA_R2 >> SHADE_SHIFT) + 2)
+static uint16_t sclera_shade[SHADE_LUT_SIZE];
+
+// Iris texture LUT: precomputed 221×221 centered at (110,110), covers full iris+rim
+#define IRIS_TEX_R    110
+#define IRIS_TEX_SIZE (2 * IRIS_TEX_R + 1)
+static uint16_t *iris_tex;  // IRIS_TEX_SIZE * IRIS_TEX_SIZE entries in PSRAM
+
+static void iris_tex_init(void)
+{
+    const int sz = IRIS_TEX_SIZE * IRIS_TEX_SIZE;
+    iris_tex = heap_caps_malloc(sz * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (!iris_tex) {
+        ESP_LOGE(TAG, "Iris texture alloc failed");
+        return;
+    }
+
+    // Simple hash for repeatable pseudo-random fiber pattern
+    // Returns 0..255
+    #define FIBER_HASH(a) ((uint8_t)(((a) * 2654435761u) >> 24))
+
+    const int rim_r = 110, iris_r = 102, inner_r = 50;
+    const int rim_r2 = rim_r * rim_r;
+    const int iris_r2 = iris_r * iris_r;
+
+    // Number of radial fiber "sectors"
+    const int n_fibers = 48;
+
+    for (int dy = -IRIS_TEX_R; dy <= IRIS_TEX_R; dy++) {
+        for (int dx = -IRIS_TEX_R; dx <= IRIS_TEX_R; dx++) {
+            int idx = (dy + IRIS_TEX_R) * IRIS_TEX_SIZE + (dx + IRIS_TEX_R);
+            int d2 = dx * dx + dy * dy;
+
+            if (d2 > rim_r2) {
+                iris_tex[idx] = 0;  // transparent (won't be drawn)
+                continue;
+            }
+            if (d2 > iris_r2) {
+                // Limbal ring — dark rim
+                iris_tex[idx] = COL_IRIS_RIM;
+                continue;
+            }
+
+            float dist = sqrtf((float)d2);
+            float angle = atan2f((float)dy, (float)dx);
+
+            // Radial position: 0 at centre, 1 at iris edge
+            float t = dist / (float)iris_r;
+
+            // Fiber pattern: angle quantized into sectors, with per-sector brightness
+            int sector = (int)((angle / (2.0f * M_PI) + 0.5f) * n_fibers) % n_fibers;
+            float fiber_bright = (FIBER_HASH(sector) / 255.0f) * 0.3f - 0.15f;  // ±0.15
+
+            // Secondary finer fibers
+            int sector2 = (int)((angle / (2.0f * M_PI) + 0.5f) * (n_fibers * 3)) % (n_fibers * 3);
+            float fiber2 = (FIBER_HASH(sector2 + 97) / 255.0f) * 0.15f - 0.075f;
+
+            // Radial gradient: lighter near pupil, richer mid-iris, darker near rim
+            float radial;
+            if (t < 0.3f) {
+                // Inner glow near pupil — slightly golden/lighter
+                radial = 0.15f * (1.0f - t / 0.3f);
+            } else {
+                // Darken towards rim
+                radial = -0.25f * ((t - 0.3f) / 0.7f);
+            }
+
+            float brightness = 1.0f + fiber_bright + fiber2 + radial;
+            if (brightness < 0.5f) brightness = 0.5f;
+            if (brightness > 1.3f) brightness = 1.3f;
+
+            // Base iris colour with variation
+            float r_base = 25.0f, g_base = 82.0f, b_base = 190.0f;
+            // Add slight warm shift near pupil
+            float warm = (t < 0.4f) ? 0.3f * (1.0f - t / 0.4f) : 0.0f;
+
+            uint8_t cr = (uint8_t)fminf(255, fmaxf(0, (r_base + warm * 40.0f) * brightness));
+            uint8_t cg = (uint8_t)fminf(255, fmaxf(0, (g_base + warm * 30.0f) * brightness));
+            uint8_t cb = (uint8_t)fminf(255, fmaxf(0, b_base * brightness));
+
+            iris_tex[idx] = rgb(cr, cg, cb);
+        }
+    }
+
+    #undef FIBER_HASH
+    ESP_LOGI(TAG, "Iris texture ready (%d KB)", sz * 2 / 1024);
+}
+
 static void sclera_lut_init(void)
 {
-    const int r = 195;
-    const int r2 = r * r;
+    const int r = SCLERA_R;
+    const int r2 = SCLERA_R2;
+
+    // Build shade LUT — sphere-like falloff: bright centre, dark edges
+    for (int i = 0; i < SHADE_LUT_SIZE; i++) {
+        float d2 = (float)(i << SHADE_SHIFT);
+        float t = d2 / (float)r2;           // 0 at centre, 1 at edge
+        if (t > 1.0f) t = 1.0f;
+        float shade = sqrtf(1.0f - t);      // lambertian sphere falloff
+        // Blend from sclera colour down to a shadow tone
+        uint8_t sr = (uint8_t)(240.0f * shade + 60.0f * (1.0f - shade));
+        uint8_t sg = (uint8_t)(240.0f * shade + 55.0f * (1.0f - shade));
+        uint8_t sb = (uint8_t)(246.0f * shade + 70.0f * (1.0f - shade));
+        sclera_shade[i] = rgb(sr, sg, sb);
+    }
+
+    // Build row spans
     for (int y = 0; y < LCD_H; y++) {
         int dy = y - EYE_CY;
         int dy2 = dy * dy;
@@ -801,26 +908,27 @@ static void eye_draw_cat(void)
 
         if (sx1 < 0) continue;  // entire row is black
 
-        // Sclera fill
-        for (int x = sx0; x <= sx1; x++) row[x] = COL_SCLERA;
+        // Shaded sclera fill (sphere falloff)
+        int dy_s2 = (y - EYE_CY) * (y - EYE_CY);
+        for (int x = sx0; x <= sx1; x++) {
+            int dx_s = x - EYE_CX;
+            int d2 = dx_s * dx_s + dy_s2;
+            row[x] = sclera_shade[d2 >> SHADE_SHIFT];
+        }
 
-        // Iris rim + iris (smaller, layered on top)
+        // Iris (textured) — single pass using precomputed LUT
         int dy_i = y - iy;
         int dy_i2 = dy_i * dy_i;
-        int rim_r2 = 110 * 110;
-        int iris_r2 = 102 * 102;
+        int rim_r2 = IRIS_TEX_R * IRIS_TEX_R;
 
         if (dy_i2 <= rim_r2) {
             int rim_dx = (int)sqrtf((float)(rim_r2 - dy_i2));
             int x0 = ix - rim_dx; if (x0 < sx0) x0 = sx0;
             int x1 = ix + rim_dx; if (x1 > sx1) x1 = sx1;
-            for (int x = x0; x <= x1; x++) row[x] = COL_IRIS_RIM;
-
-            if (dy_i2 <= iris_r2) {
-                int iris_dx = (int)sqrtf((float)(iris_r2 - dy_i2));
-                x0 = ix - iris_dx; if (x0 < sx0) x0 = sx0;
-                x1 = ix + iris_dx; if (x1 > sx1) x1 = sx1;
-                for (int x = x0; x <= x1; x++) row[x] = COL_IRIS;
+            int tex_row = (dy_i + IRIS_TEX_R) * IRIS_TEX_SIZE;
+            for (int x = x0; x <= x1; x++) {
+                int dx_i = x - ix;
+                row[x] = iris_tex[tex_row + dx_i + IRIS_TEX_R];
             }
         }
 
@@ -952,6 +1060,7 @@ void app_main(void)
     imu_init();
     mic_init();
     eye_init();
+    iris_tex_init();
     sclera_lut_init();
     spiral_lut_init();
 
