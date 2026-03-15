@@ -30,8 +30,10 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
+#include "driver/i2s_std.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -58,6 +60,12 @@ static const char *TAG = "eye";
 
 #define PIN_I2C_SDA    11
 #define PIN_I2C_SCL    10
+
+#define PIN_MIC_WS      2
+#define PIN_MIC_SCK    15
+#define PIN_MIC_SD     39
+
+#define PIN_TP_INT      4
 
 // TCA9554 GPIO expander
 #define TCA9554_ADDR   0x20
@@ -243,10 +251,10 @@ static void lcd_init(void)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num        = -1,    // QSPI has no D/C line; cmd embedded in transfer
         .cs_gpio_num        = PIN_LCD_CS,
-        .pclk_hz            = 40 * 1000 * 1000,
+        .pclk_hz            = 20 * 1000 * 1000,
         .lcd_cmd_bits       = 32,
         .lcd_param_bits     = 8,
-        .spi_mode           = 0,
+        .spi_mode           = 3,
         .trans_queue_depth  = 10,
         .flags = {
             .quad_mode = true,
@@ -267,10 +275,16 @@ static void lcd_init(void)
                                               &io_config, &io_handle));
 
     // Create SPD2010 panel
+    spd2010_vendor_config_t vendor_cfg = {
+        .flags = {
+            .use_qspi_interface = 1,
+        },
+    };
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = -1,   // reset handled via TCA9554 above
-        .color_space    = ESP_LCD_COLOR_SPACE_RGB,
+        .data_endian    = LCD_RGB_DATA_ENDIAN_BIG,
         .bits_per_pixel = 16,
+        .vendor_config  = &vendor_cfg,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_spd2010(io_handle, &panel_cfg, &panel));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
@@ -282,13 +296,147 @@ static void lcd_init(void)
     ESP_LOGI(TAG, "Display ready (SPD2010 QSPI 412x412)");
 }
 
-/** Push the full draw_fb to the display via the esp_lcd DMA path. */
+// ─────────────────────────────────────────────────────────────────────────────
+// Touch — direct I2C to SPD2010 integrated touch controller (addr 0x53)
+// ─────────────────────────────────────────────────────────────────────────────
+#define TP_ADDR  0x53
+
+typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD } display_mode_t;
+static display_mode_t display_mode = MODE_CAT_EYE;
+static int64_t last_touch_us = 0;
+
+static esp_err_t tp_i2c_write(const uint8_t *data, size_t len)
+{
+    i2c_cmd_handle_t h = i2c_cmd_link_create();
+    i2c_master_start(h);
+    i2c_master_write_byte(h, (TP_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(h, data, len, true);
+    i2c_master_stop(h);
+    esp_err_t e = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(50));
+    i2c_cmd_link_delete(h);
+    return e;
+}
+
+static esp_err_t tp_i2c_read(uint8_t *out, size_t len)
+{
+    i2c_cmd_handle_t h = i2c_cmd_link_create();
+    i2c_master_start(h);
+    i2c_master_write_byte(h, (TP_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(h, out, len, I2C_MASTER_LAST_NACK);
+    i2c_master_stop(h);
+    esp_err_t e = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(50));
+    i2c_cmd_link_delete(h);
+    return e;
+}
+
+static void touch_init(void)
+{
+    // Read status to see if touch CPU needs starting
+    uint8_t cmd[4] = {0x20, 0x00};
+    uint8_t status[4] = {0};
+    tp_i2c_write(cmd, 2);
+    esp_rom_delay_us(200);
+    tp_i2c_read(status, 4);
+
+    bool in_bios = (status[1] >> 6) & 1;
+    bool in_cpu  = (status[1] >> 5) & 1;
+
+    if (in_bios) {
+        // Clear INT + start CPU
+        uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
+        tp_i2c_write(clr, 4); esp_rom_delay_us(200);
+        uint8_t cpu[] = {0x04, 0x00, 0x01, 0x00};
+        tp_i2c_write(cpu, 4); esp_rom_delay_us(200);
+        ESP_LOGI(TAG, "Touch: started CPU from BIOS");
+        vTaskDelay(pdMS_TO_TICKS(100));
+    } else if (in_cpu) {
+        // Set point mode + start + clear INT
+        uint8_t pm[] = {0x50, 0x00, 0x00, 0x00};
+        tp_i2c_write(pm, 4); esp_rom_delay_us(200);
+        uint8_t st[] = {0x46, 0x00, 0x00, 0x00};
+        tp_i2c_write(st, 4); esp_rom_delay_us(200);
+        uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
+        tp_i2c_write(clr, 4); esp_rom_delay_us(200);
+        ESP_LOGI(TAG, "Touch: configured point mode");
+    }
+
+    ESP_LOGI(TAG, "Touch ready (tap to toggle mode)");
+}
+
+/** Poll touch — returns true if a new tap detected. */
+static bool touch_check(void)
+{
+    // Read status + length
+    uint8_t cmd[2] = {0x20, 0x00};
+    uint8_t status[4] = {0};
+    if (tp_i2c_write(cmd, 2) != ESP_OK) return false;
+    esp_rom_delay_us(200);
+    if (tp_i2c_read(status, 4) != ESP_OK) return false;
+
+    bool pt_exist = status[0] & 0x01;
+    uint16_t read_len = (status[3] << 8) | status[2];
+
+    if (pt_exist && read_len > 0) {
+        // Read touch data to clear the interrupt
+        uint8_t hdr[2] = {0x00, 0x03};
+        uint8_t data[64] = {0};
+        int rlen = read_len > sizeof(data) ? sizeof(data) : read_len;
+        tp_i2c_write(hdr, 2);
+        esp_rom_delay_us(200);
+        tp_i2c_read(data, rlen);
+
+        // Clear INT
+        uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
+        tp_i2c_write(clr, 4);
+
+        // Debounce
+        int64_t now = esp_timer_get_time();
+        if (now - last_touch_us > 500000) {
+            last_touch_us = now;
+            return true;
+        }
+    } else if (status[1] & 0x08) {
+        // CPU running but no data — just clear INT
+        uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
+        tp_i2c_write(clr, 4);
+    }
+
+    return false;
+}
+
+// TE (tearing effect) sync — wait for display vsync before flushing
+static SemaphoreHandle_t te_sem;
+
+static void IRAM_ATTR te_isr(void *arg)
+{
+    BaseType_t wake = pdFALSE;
+    xSemaphoreGiveFromISR(te_sem, &wake);
+    if (wake) portYIELD_FROM_ISR();
+}
+
+static void te_init(void)
+{
+    te_sem = xSemaphoreCreateBinary();
+    gpio_config_t te_cfg = {
+        .pin_bit_mask = (1ULL << PIN_LCD_TE),
+        .mode = GPIO_MODE_INPUT,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+    gpio_config(&te_cfg);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PIN_LCD_TE, te_isr, NULL);
+}
+
+/** Push the full draw_fb to the display, synced to TE signal. */
 static void lcd_flush(void)
 {
     // Top half
     memcpy(fb[0], draw_fb,                   LCD_W * HALF_H * sizeof(uint16_t));
     // Bottom half
     memcpy(fb[1], draw_fb + LCD_W * HALF_H,  LCD_W * HALF_H * sizeof(uint16_t));
+
+    // Wait for TE pulse (vsync) before sending — eliminates tearing
+    xSemaphoreTake(te_sem, pdMS_TO_TICKS(50));
 
     esp_lcd_panel_draw_bitmap(panel, 0, 0,        LCD_W, HALF_H, fb[0]);
     esp_lcd_panel_draw_bitmap(panel, 0, HALF_H,   LCD_W, LCD_H,  fb[1]);
@@ -301,6 +449,7 @@ static void lcd_flush(void)
 #define QMI_CTRL1    0x02
 #define QMI_CTRL2    0x03
 #define QMI_CTRL7    0x08
+#define QMI_STATUS0  0x2E
 #define QMI_AX_L     0x35
 
 static uint8_t qmi_addr = 0x6B;
@@ -314,19 +463,42 @@ static void imu_init(void)
     }
     ESP_LOGI(TAG, "QMI8658 WHO_AM_I=0x%02X @ 0x%02X", who, qmi_addr);
 
-    i2c_write_reg(qmi_addr, QMI_CTRL1, 0x20);   // little-endian, addr auto-inc
+    i2c_write_reg(qmi_addr, QMI_CTRL1, 0x40);   // addr auto-inc, little-endian
     i2c_write_reg(qmi_addr, QMI_CTRL2, 0x16);   // accel ±4 g, 58.75 Hz
     i2c_write_reg(qmi_addr, QMI_CTRL7, 0x03);   // enable accel + gyro
     vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Verify config registers took
+    uint8_t ctrl1 = 0, ctrl2 = 0, ctrl7 = 0;
+    i2c_read_reg(qmi_addr, QMI_CTRL1, &ctrl1, 1);
+    i2c_read_reg(qmi_addr, QMI_CTRL2, &ctrl2, 1);
+    i2c_read_reg(qmi_addr, QMI_CTRL7, &ctrl7, 1);
+    ESP_LOGI(TAG, "IMU verify: CTRL1=0x%02X CTRL2=0x%02X CTRL7=0x%02X", ctrl1, ctrl2, ctrl7);
     ESP_LOGI(TAG, "IMU ready");
 }
 
+static int imu_log_counter = 0;
+
 static void imu_accel(float *ax, float *ay, float *az)
 {
+    // Read STATUS0 first — this latches the data registers
+    uint8_t status = 0;
+    i2c_read_reg(qmi_addr, QMI_STATUS0, &status, 1);
+
     uint8_t raw[6];
-    if (i2c_read_reg(qmi_addr, QMI_AX_L, raw, 6) != ESP_OK) {
+    esp_err_t err = i2c_read_reg(qmi_addr, QMI_AX_L, raw, 6);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "IMU read failed: %s", esp_err_to_name(err));
         *ax = *ay = *az = 0; return;
     }
+
+    // Dump raw bytes periodically
+    if (++imu_log_counter >= 10) {
+        imu_log_counter = 0;
+        ESP_LOGI(TAG, "IMU status=0x%02X raw[0x35..0x3A]: %02X %02X %02X %02X %02X %02X",
+                 status, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+    }
+
     // ±4 g range: 1 g = 8192 LSB
     *ax = (int16_t)((raw[1] << 8) | raw[0]) / 8192.0f;
     *ay = (int16_t)((raw[3] << 8) | raw[2]) / 8192.0f;
@@ -334,23 +506,80 @@ static void imu_accel(float *ax, float *ay, float *az)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Microphone (I2S) — measures loudness for pupil dilation
+// ─────────────────────────────────────────────────────────────────────────────
+#define MIC_SAMPLE_RATE  16000
+#define MIC_BUF_SAMPLES  256
+
+static i2s_chan_handle_t mic_handle;
+static float mic_loudness = 0;   // smoothed loudness (0..1)
+
+static void mic_init(void)
+{
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &mic_handle));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = PIN_MIC_SCK,
+            .ws   = PIN_MIC_WS,
+            .din  = PIN_MIC_SD,
+            .dout = I2S_GPIO_UNUSED,
+            .invert_flags = { false, false, false },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(mic_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(mic_handle));
+    ESP_LOGI(TAG, "Microphone ready (I2S %d Hz)", MIC_SAMPLE_RATE);
+}
+
+/** Read a block of mic samples and return RMS loudness (0..1). */
+static float mic_read_loudness(void)
+{
+    int32_t buf[MIC_BUF_SAMPLES];
+    size_t bytes_read = 0;
+    esp_err_t err = i2s_channel_read(mic_handle, buf, sizeof(buf), &bytes_read, 0);
+    if (err != ESP_OK || bytes_read == 0) return mic_loudness;
+
+    int samples = bytes_read / sizeof(int32_t);
+    int64_t sum_sq = 0;
+    for (int i = 0; i < samples; i++) {
+        int32_t s = buf[i] >> 8;  // 24-bit data in 32-bit frame
+        sum_sq += (int64_t)s * s;
+    }
+    float rms = sqrtf((float)(sum_sq / samples));
+
+    // Normalize — typical I2S mic range, adjust if needed
+    float level = rms / 100000.0f;
+    if (level > 1.0f) level = 1.0f;
+
+    // Smooth: fast attack, slow decay
+    if (level > mic_loudness)
+        mic_loudness = mic_loudness * 0.3f + level * 0.7f;
+    else
+        mic_loudness = mic_loudness * 0.9f + level * 0.1f;
+
+    return mic_loudness;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Eyeball state & animation
 // ─────────────────────────────────────────────────────────────────────────────
-#define MAX_IRIS_TRAVEL  65.0f   // max pupil offset from centre — scaled for 412px
+#define MAX_EYE_TRAVEL  80.0f   // max eye offset from display centre
+#define MAX_RATTLE      80.0f   // max iris rattle offset within sclera
 
 typedef struct {
-    float px, py;           // current iris offset
-    float vx, vy;           // velocity (px/s)
-    float tx, ty;           // spring target
-    float blink;            // 0=open .. 1=closed
-    bool  blinking;
-    float blink_t;
-    float prev_az;
-    bool  az_init;
-    int64_t next_saccade_us;
-    float sacc_tx, sacc_ty;
-    bool  in_saccade;
-    float sacc_t;
+    float px, py;           // current iris offset from display centre
+    float vx, vy;           // iris velocity (px/s)
+    float tx, ty;           // iris spring target
+    // Pupil rattle — reacts to sudden acceleration
+    float rpx, rpy;         // rattle offset from iris centre
+    float rvx, rvy;         // rattle velocity
+    float prev_ax, prev_ay; // previous accel for jerk detection
+    bool  accel_init;
 } EyeState;
 
 static EyeState eye;
@@ -358,111 +587,181 @@ static EyeState eye;
 static void eye_init(void)
 {
     memset(&eye, 0, sizeof(eye));
-    eye.next_saccade_us = esp_timer_get_time() + (2000 + esp_random() % 2000) * 1000LL;
 }
+
+static int log_counter = 0;
 
 static void eye_update(float ax, float ay, float az, float dt)
 {
-    // 1. Tilt target
-    float tx = -ax * 85.0f;
-    float ty =  ay * 85.0f;
-    float dist = sqrtf(tx*tx + ty*ty);
-    if (dist > MAX_IRIS_TRAVEL) { tx = tx/dist*MAX_IRIS_TRAVEL; ty = ty/dist*MAX_IRIS_TRAVEL; }
-    eye.tx = tx;
-    eye.ty = ty;
+    // Iris stays centred — only rattle moves the pupil
+    eye.px = 0;
+    eye.py = 0;
 
-    // 2. Idle saccade
+    // Pupil rattle — sudden accel changes kick the pupil
+    if (!eye.accel_init) {
+        eye.prev_ax = ax; eye.prev_ay = ay;
+        eye.accel_init = true;
+    }
+    float dax = ax - eye.prev_ax;
+    float day = ay - eye.prev_ay;
+    eye.prev_ax = ax;
+    eye.prev_ay = ay;
+
+    // Apply delta-accel as impulse (swapped axes like tilt)
+    float da_mag = sqrtf(dax*dax + day*day);
+    if (da_mag > 0.05f) {
+        ESP_LOGI(TAG, "RATTLE: dax=%.3f day=%.3f mag=%.3f rpx=%.1f rpy=%.1f rvx=%.1f rvy=%.1f",
+                 dax, day, da_mag, eye.rpx, eye.rpy, eye.rvx, eye.rvy);
+    }
+    const float kick = 600.0f;
+    eye.rvx +=  day * kick;
+    eye.rvy += -dax * kick;
+
+    // Rattle spring — slow enough to be visible at ~14fps
+    const float rk = 15.0f, rc = 3.0f;
+    eye.rvx += (-rk * eye.rpx - rc * eye.rvx) * dt;
+    eye.rvy += (-rk * eye.rpy - rc * eye.rvy) * dt;
+    eye.rpx += eye.rvx * dt;
+    eye.rpy += eye.rvy * dt;
+
+    // Clamp rattle
+    float rd = sqrtf(eye.rpx * eye.rpx + eye.rpy * eye.rpy);
+    if (rd > MAX_RATTLE) {
+        eye.rpx = eye.rpx / rd * MAX_RATTLE;
+        eye.rpy = eye.rpy / rd * MAX_RATTLE;
+    }
+
+    // Log every 10 frames
     int64_t now = esp_timer_get_time();
-    if (!eye.in_saccade && now >= eye.next_saccade_us) {
-        float angle = (float)(esp_random() % 628) / 100.0f;
-        float r     = (float)(esp_random() % (int)MAX_IRIS_TRAVEL);
-        eye.sacc_tx = cosf(angle) * r;
-        eye.sacc_ty = sinf(angle) * r;
-        eye.in_saccade = true;
-        eye.sacc_t = 0;
-    }
-    if (eye.in_saccade) {
-        eye.sacc_t += dt;
-        if (eye.sacc_t < 0.12f) { eye.tx = eye.sacc_tx; eye.ty = eye.sacc_ty; }
-        else if (eye.sacc_t > 0.4f) {
-            eye.in_saccade = false;
-            eye.next_saccade_us = now + (2000 + esp_random() % 3000) * 1000LL;
-        }
-    }
-
-    // 3. Spring-damper
-    const float k = 14.0f, c = 6.0f;
-    eye.vx += (-k * (eye.px - eye.tx) - c * eye.vx) * dt;
-    eye.vy += (-k * (eye.py - eye.ty) - c * eye.vy) * dt;
-    eye.px += eye.vx * dt;
-    eye.py += eye.vy * dt;
-
-    // 4. Jump / blink detection  (sharp ΔZ)
-    if (!eye.az_init) { eye.prev_az = az; eye.az_init = true; }
-    float daz = az - eye.prev_az;
-    eye.prev_az = az;
-    if (!eye.blinking && fabsf(daz) > 1.4f) {
-        eye.blinking = true;
-        eye.blink_t  = 0;
-        ESP_LOGI(TAG, "Blink! daz=%.2f", daz);
-    }
-
-    // 5. Blink animation (triangle wave over 350 ms)
-    if (eye.blinking) {
-        eye.blink_t += dt;
-        const float HALF = 0.175f;
-        float t = eye.blink_t / HALF;
-        eye.blink = (t < 1.0f) ? t : (2.0f - t);
-        if (eye.blink < 0) eye.blink = 0;
-        if (eye.blink > 1) eye.blink = 1;
-        if (eye.blink_t >= HALF * 2.0f) { eye.blinking = false; eye.blink = 0; }
+    if (++log_counter >= 10) {
+        log_counter = 0;
+        ESP_LOGI(TAG, "t=%lld dt=%.1fms | IMU: ax=%.3f ay=%.3f az=%.3f | "
+                 "pos=(%.1f,%.1f) | loud=%.3f",
+                 now / 1000, dt * 1000.0f, ax, ay, az,
+                 eye.px, eye.py, mic_loudness);
     }
 }
 
-static void eye_draw(void)
+/** Draw a filled vertical slit (cat pupil) centred at (cx, cy).
+ *  h = half-height, w = half-width at the widest point (middle). */
+static void draw_cat_pupil(int cx, int cy, int h, int w, uint16_t col)
+{
+    for (int dy = -h; dy <= h; dy++) {
+        // Elliptical profile: wider in the middle, pointed at top/bottom
+        float t = (float)dy / (float)h;          // -1..1
+        int half_w = (int)(w * sqrtf(1.0f - t * t));  // ellipse width
+        if (half_w < 1) half_w = 1;
+        hline(cx - half_w, cx + half_w, cy + dy, col);
+    }
+}
+
+static void eye_draw_cat(void)
 {
     int px = EYE_CX + (int)eye.px;
     int py = EYE_CY + (int)eye.py;
 
-    // ── Background ─────────────────────────────────────────────────────────
     memset(draw_fb, 0, LCD_PIXELS * sizeof(uint16_t));
 
-    // ── Sclera ─────────────────────────────────────────────────────────────
+    // Sclera (fixed)
     draw_circle(EYE_CX, EYE_CY, 195, COL_SCLERA);
 
-    // Subtle blood vessels near the corners
-    draw_circle(EYE_CX - 130, EYE_CY + 35, 10, COL_VESSEL);
-    draw_circle(EYE_CX + 122, EYE_CY - 25,  8, COL_VESSEL);
-    draw_circle(EYE_CX - 130, EYE_CY + 35,  6, COL_SCLERA);
-    draw_circle(EYE_CX + 122, EYE_CY - 25,  5, COL_SCLERA);
+    // Iris + pupil (rattle together)
+    int ix = px + (int)eye.rpx;
+    int iy = py + (int)eye.rpy;
+    draw_circle(ix, iy, 110, COL_IRIS_RIM);
+    draw_circle(ix, iy, 102, COL_IRIS);
 
-    // ── Iris ───────────────────────────────────────────────────────────────
-    draw_circle(px, py, 110, COL_IRIS_RIM);   // limbal ring
-    draw_circle(px, py, 102, COL_IRIS);        // main iris
-    draw_circle(px, py,  76, COL_IRIS_RIM);   // darker inner zone
-    draw_circle(px, py,  70, COL_IRIS_IN);    // inner iris
+    // Cat-eye pupil — dilates with loudness
+    int pupil_w = 16 + (int)(mic_loudness * 70);
+    draw_cat_pupil(ix, iy, 90, pupil_w, COL_PUPIL);
 
-    // ── Pupil ──────────────────────────────────────────────────────────────
-    draw_circle(px, py, 47, COL_PUPIL);
+    // Corneal glint
+    draw_circle(ix + 27, iy - 27, 14, COL_GLINT1);
+}
 
-    // ── Corneal glints ─────────────────────────────────────────────────────
-    draw_circle(px + 27, py - 27, 18, COL_GLINT1);  // main specular
-    draw_circle(px - 21, py + 30,  8, COL_GLINT2);  // secondary glint
+// ─────────────────────────────────────────────────────────────────────────────
+// Hypnotoad spiral
+// ─────────────────────────────────────────────────────────────────────────────
+static float spiral_phase = 0;
 
-    // ── Eyelids ────────────────────────────────────────────────────────────
-    // upper_y sweeps DOWN as blink→1 (lid closes from top)
-    // lower_y sweeps UP  as blink→1 (lid closes from bottom)
-    int upper_y = (int)(-6   + eye.blink * (EYE_CY + 16));
-    int lower_y = (int)(LCD_H + 6 - eye.blink * (LCD_H - EYE_CY + 16));
+// Spiral colour palette — alternating bands
+#define COL_SPIRAL_A  rgb(255,  50,   0)   // red-orange
+#define COL_SPIRAL_B  rgb(255, 220,   0)   // yellow
+#define COL_SPIRAL_C  rgb( 20, 180,  20)   // green
+#define COL_SPIRAL_D  rgb(255, 120,   0)   // orange
 
-    if (upper_y > 0) {
-        draw_hband(0,           upper_y - 8, COL_SKIN);
-        draw_hband(upper_y - 7, upper_y,     COL_LASH);
+// Precomputed lookup tables for spiral (avoid per-pixel atan2f/sqrtf)
+static uint8_t *spiral_lut = NULL;  // angle*256/(2*PI) + dist_scaled per pixel
+
+static void spiral_lut_init(void)
+{
+    // Store (angle_component + dist_component) * 4 as uint8_t for each pixel
+    // We only need it mod 4, so store as fixed-point and use at draw time
+    spiral_lut = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
+    if (!spiral_lut) {
+        ESP_LOGE(TAG, "Spiral LUT alloc failed");
+        return;
     }
-    if (lower_y < LCD_H) {
-        draw_hband(lower_y,     lower_y + 7, COL_LASH);
-        draw_hband(lower_y + 8, LCD_H - 1,   COL_SKIN);
+    const float band_width = 40.0f;
+    for (int y = 0; y < LCD_H; y++) {
+        for (int x = 0; x < LCD_W; x++) {
+            float dx = x - EYE_CX;
+            float dy = y - EYE_CY;
+            float dist_sq = dx * dx + dy * dy;
+            if (dist_sq > 195.0f * 195.0f) {
+                spiral_lut[y * LCD_W + x] = 0xFF; // outside circle marker
+                continue;
+            }
+            float dist = sqrtf(dist_sq);
+            float angle = atan2f(dy, dx);
+            // Encode as fixed-point: (angle/(2*PI) + dist/band_width) * 256
+            float val = (angle / (2.0f * M_PI) + dist / band_width) * 256.0f;
+            // Store lower 8 bits (wraps naturally)
+            spiral_lut[y * LCD_W + x] = (uint8_t)((int)val & 0xFF);
+        }
     }
+    ESP_LOGI(TAG, "Spiral LUT ready");
+}
+
+static void eye_draw_hypnotoad(void)
+{
+    if (!spiral_lut) return;
+
+    const uint16_t palette[] = { COL_SPIRAL_A, COL_SPIRAL_B, COL_SPIRAL_C, COL_SPIRAL_D };
+    // Phase offset as fixed-point matching LUT encoding
+    uint8_t phase_offset = (uint8_t)((int)(spiral_phase * 256.0f) & 0xFF);
+
+    uint16_t black = COL_BLACK;
+    for (int i = 0; i < LCD_PIXELS; i++) {
+        uint8_t lut_val = spiral_lut[i];
+        if (lut_val == 0xFF) {
+            draw_fb[i] = black;
+        } else {
+            // Subtract phase to make spiral move outward, divide by 64 for 4 bands
+            uint8_t band = ((lut_val - phase_offset) >> 6) & 0x03;
+            draw_fb[i] = palette[band];
+        }
+    }
+
+    // Dark pupil in centre
+    draw_circle(EYE_CX, EYE_CY, 30, COL_PUPIL);
+
+    spiral_phase += 0.08f;
+    if (spiral_phase > 1.0f) spiral_phase -= 1.0f;
+}
+
+static int mode_log_counter = 0;
+
+static void eye_draw(void)
+{
+    if (++mode_log_counter >= 10) {
+        mode_log_counter = 0;
+        ESP_LOGI(TAG, "mode=%s", display_mode == MODE_HYPNOTOAD ? "HYPNOTOAD" : "CAT_EYE");
+    }
+    if (display_mode == MODE_HYPNOTOAD)
+        eye_draw_hypnotoad();
+    else
+        eye_draw_cat();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -488,10 +787,17 @@ void app_main(void)
     i2c_init();
     tca9554_init();
     lcd_init();
+    te_init();
+    touch_init();
     imu_init();
+    mic_init();
     eye_init();
+    spiral_lut_init();
 
     int64_t prev_us = esp_timer_get_time();
+
+    int frame_count = 0;
+    int64_t fps_timer_us = esp_timer_get_time();
 
     while (1) {
         int64_t now_us = esp_timer_get_time();
@@ -501,10 +807,26 @@ void app_main(void)
 
         float ax, ay, az;
         imu_accel(&ax, &ay, &az);
+        mic_read_loudness();
+
+        if (touch_check()) {
+            display_mode = (display_mode == MODE_CAT_EYE) ? MODE_HYPNOTOAD : MODE_CAT_EYE;
+            ESP_LOGI(TAG, "Touch! Switching to %s",
+                     display_mode == MODE_HYPNOTOAD ? "HYPNOTOAD" : "CAT_EYE");
+        }
 
         eye_update(ax, ay, az, dt);
         eye_draw();
         lcd_flush();
+
+        // FPS counter — log every second
+        frame_count++;
+        int64_t elapsed = now_us - fps_timer_us;
+        if (elapsed >= 1000000) {
+            ESP_LOGI(TAG, "FPS: %.1f", frame_count * 1e6f / elapsed);
+            frame_count = 0;
+            fps_timer_us = now_us;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(5));
     }
