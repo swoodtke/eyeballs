@@ -3,6 +3,7 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
         driver
+        esp_driver_i2c
         esp_driver_i2s
         esp_timer
         esp_lcd

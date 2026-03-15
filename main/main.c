@@ -32,7 +32,14 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
+// Define USE_NEW_I2C_API to use the new i2c_master driver instead of the legacy one.
+// The legacy driver is more tolerant of clock stretching on this board's shared bus.
+// #define USE_NEW_I2C_API
+#ifdef USE_NEW_I2C_API
+#include "driver/i2c_master.h"
+#else
 #include "driver/i2c.h"
+#endif
 #include "driver/i2s_std.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
@@ -67,8 +74,9 @@ static const char *TAG = "eye";
 
 #define PIN_TP_INT      4
 
-// TCA9554 GPIO expander
+// I2C device addresses
 #define TCA9554_ADDR   0x20
+#define TP_ADDR        0x53
 #define TCA9554_INPUT  0x00
 #define TCA9554_OUTPUT 0x01
 #define TCA9554_CFG    0x03
@@ -163,7 +171,69 @@ static void draw_hband(int y0, int y1, uint16_t col)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // I2C helpers  (shared bus: TCA9554 + QMI8658 + touch + RTC)
+//
+// Both legacy and new driver expose the same interface:
+//   i2c_init(), i2c_write_reg(addr, reg, val), i2c_read_reg(addr, reg, out, len)
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Per-device I2C transaction counters (keyed by address)
+static uint32_t i2c_txn_tca = 0, i2c_txn_qmi = 0, i2c_txn_tp = 0;
+static uint8_t qmi_addr = 0x6B;   // resolved at runtime in imu_init
+
+static void i2c_count(uint8_t addr)
+{
+    if (addr == TCA9554_ADDR)  i2c_txn_tca++;
+    else if (addr == qmi_addr) i2c_txn_qmi++;
+    else if (addr == TP_ADDR)  i2c_txn_tp++;
+}
+
+#ifdef USE_NEW_I2C_API
+
+static i2c_master_bus_handle_t i2c_bus;
+static i2c_master_dev_handle_t i2c_devs[128];  // handle cache by 7-bit addr
+
+static void i2c_init(void)
+{
+    memset(i2c_devs, 0, sizeof(i2c_devs));
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = PIN_I2C_SDA,
+        .scl_io_num = PIN_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus));
+}
+
+static i2c_master_dev_handle_t i2c_get_dev(uint8_t addr)
+{
+    if (!i2c_devs[addr]) {
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = 400000,
+            .scl_wait_us = 5000,
+        };
+        ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &dev_cfg, &i2c_devs[addr]));
+    }
+    return i2c_devs[addr];
+}
+
+static esp_err_t i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
+{
+    i2c_count(addr);
+    uint8_t buf[2] = { reg, val };
+    return i2c_master_transmit(i2c_get_dev(addr), buf, 2, 50);
+}
+
+static esp_err_t i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *out, size_t len)
+{
+    i2c_count(addr);
+    return i2c_master_transmit_receive(i2c_get_dev(addr), &reg, 1, out, len, 100);
+}
+
+#else  // Legacy I2C driver
+
 static void i2c_init(void)
 {
     i2c_config_t cfg = {
@@ -180,6 +250,7 @@ static void i2c_init(void)
 
 static esp_err_t i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
 {
+    i2c_count(addr);
     uint8_t buf[2] = { reg, val };
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     i2c_master_start(h);
@@ -193,6 +264,7 @@ static esp_err_t i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
 
 static esp_err_t i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *out, size_t len)
 {
+    i2c_count(addr);
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     i2c_master_start(h);
     i2c_master_write_byte(h, (addr << 1) | I2C_MASTER_WRITE, true);
@@ -206,6 +278,8 @@ static esp_err_t i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *out, size_t le
     return e;
 }
 
+#endif  // USE_NEW_I2C_API
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TCA9554 GPIO expander
 // ─────────────────────────────────────────────────────────────────────────────
@@ -213,9 +287,7 @@ static uint8_t tca_output = 0xFF;   // cached output register
 
 static void tca9554_init(void)
 {
-    // Configure all pins as outputs (0 = output in TCA9554 config register)
     i2c_write_reg(TCA9554_ADDR, TCA9554_CFG, 0x00);
-    // Drive all high initially
     tca_output = 0xFF;
     i2c_write_reg(TCA9554_ADDR, TCA9554_OUTPUT, tca_output);
 }
@@ -299,14 +371,28 @@ static void lcd_init(void)
 // ─────────────────────────────────────────────────────────────────────────────
 // Touch — direct I2C to SPD2010 integrated touch controller (addr 0x53)
 // ─────────────────────────────────────────────────────────────────────────────
-#define TP_ADDR  0x53
 
 typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD } display_mode_t;
 static display_mode_t display_mode = MODE_CAT_EYE;
 static int64_t last_touch_us = 0;
 
+static SemaphoreHandle_t tp_sem;
+static volatile uint32_t tp_isr_count = 0;
+
+static void IRAM_ATTR tp_isr(void *arg)
+{
+    tp_isr_count++;
+    BaseType_t wake = pdFALSE;
+    xSemaphoreGiveFromISR(tp_sem, &wake);
+    if (wake) portYIELD_FROM_ISR();
+}
+
 static esp_err_t tp_i2c_write(const uint8_t *data, size_t len)
 {
+    i2c_txn_tp++;
+#ifdef USE_NEW_I2C_API
+    return i2c_master_transmit(i2c_get_dev(TP_ADDR), data, len, 50);
+#else
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     i2c_master_start(h);
     i2c_master_write_byte(h, (TP_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -315,28 +401,36 @@ static esp_err_t tp_i2c_write(const uint8_t *data, size_t len)
     esp_err_t e = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(50));
     i2c_cmd_link_delete(h);
     return e;
+#endif
 }
 
-static esp_err_t tp_i2c_read(uint8_t *out, size_t len)
+static esp_err_t tp_i2c_write_read(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out_len)
 {
+    i2c_txn_tp++;
+#ifdef USE_NEW_I2C_API
+    return i2c_master_transmit_receive(i2c_get_dev(TP_ADDR), cmd, cmd_len, out, out_len, 100);
+#else
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     i2c_master_start(h);
+    i2c_master_write_byte(h, (TP_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(h, cmd, cmd_len, true);
+    i2c_master_start(h);
     i2c_master_write_byte(h, (TP_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(h, out, len, I2C_MASTER_LAST_NACK);
+    i2c_master_read(h, out, out_len, I2C_MASTER_LAST_NACK);
     i2c_master_stop(h);
     esp_err_t e = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(50));
     i2c_cmd_link_delete(h);
     return e;
+#endif
 }
 
 static void touch_init(void)
 {
+
     // Read status to see if touch CPU needs starting
-    uint8_t cmd[4] = {0x20, 0x00};
+    uint8_t cmd[2] = {0x20, 0x00};
     uint8_t status[4] = {0};
-    tp_i2c_write(cmd, 2);
-    esp_rom_delay_us(200);
-    tp_i2c_read(status, 4);
+    tp_i2c_write_read(cmd, 2, status, 4);
 
     bool in_bios = (status[1] >> 6) & 1;
     bool in_cpu  = (status[1] >> 5) & 1;
@@ -360,32 +454,46 @@ static void touch_init(void)
         ESP_LOGI(TAG, "Touch: configured point mode");
     }
 
-    ESP_LOGI(TAG, "Touch ready (tap to toggle mode)");
+    // Set up interrupt on TP_INT (active low)
+    tp_sem = xSemaphoreCreateBinary();
+    gpio_config_t tp_cfg = {
+        .pin_bit_mask = (1ULL << PIN_TP_INT),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    gpio_config(&tp_cfg);
+    gpio_isr_handler_add(PIN_TP_INT, tp_isr, NULL);
+
+    ESP_LOGI(TAG, "Touch ready (tap to toggle mode, INT on GPIO%d)", PIN_TP_INT);
 }
 
-/** Poll touch — returns true if a new tap detected. */
+static uint32_t tp_serviced_count = 0;
+static uint32_t tp_spurious_count = 0;
+
+/** Check touch — only reads I2C when TP_INT fires. */
 static bool touch_check(void)
 {
+    // Only proceed if the touch controller signalled an interrupt
+    if (xSemaphoreTake(tp_sem, 0) != pdTRUE) return false;
+
     // Read status + length
     uint8_t cmd[2] = {0x20, 0x00};
     uint8_t status[4] = {0};
-    if (tp_i2c_write(cmd, 2) != ESP_OK) return false;
-    esp_rom_delay_us(200);
-    if (tp_i2c_read(status, 4) != ESP_OK) return false;
+    if (tp_i2c_write_read(cmd, 2, status, 4) != ESP_OK) return false;
 
     bool pt_exist = status[0] & 0x01;
     uint16_t read_len = (status[3] << 8) | status[2];
 
     if (pt_exist && read_len > 0) {
-        // Read touch data to clear the interrupt
+        tp_serviced_count++;
+        // Read touch data to clear the controller's interrupt
         uint8_t hdr[2] = {0x00, 0x03};
         uint8_t data[64] = {0};
         int rlen = read_len > sizeof(data) ? sizeof(data) : read_len;
-        tp_i2c_write(hdr, 2);
-        esp_rom_delay_us(200);
-        tp_i2c_read(data, rlen);
+        tp_i2c_write_read(hdr, 2, data, rlen);
 
-        // Clear INT
+        // Clear INT flag
         uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
         tp_i2c_write(clr, 4);
 
@@ -395,8 +503,9 @@ static bool touch_check(void)
             last_touch_us = now;
             return true;
         }
-    } else if (status[1] & 0x08) {
-        // CPU running but no data — just clear INT
+    } else {
+        tp_spurious_count++;
+        // INT fired but no point data — just clear the flag
         uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
         tp_i2c_write(clr, 4);
     }
@@ -406,9 +515,11 @@ static bool touch_check(void)
 
 // TE (tearing effect) sync — wait for display vsync before flushing
 static SemaphoreHandle_t te_sem;
+static volatile uint32_t te_isr_count = 0;
 
 static void IRAM_ATTR te_isr(void *arg)
 {
+    te_isr_count++;
     BaseType_t wake = pdFALSE;
     xSemaphoreGiveFromISR(te_sem, &wake);
     if (wake) portYIELD_FROM_ISR();
@@ -452,10 +563,10 @@ static void lcd_flush(void)
 #define QMI_STATUS0  0x2E
 #define QMI_AX_L     0x35
 
-static uint8_t qmi_addr = 0x6B;
-
 static void imu_init(void)
 {
+    // Try 0x6B first, fallback to 0x6A
+    qmi_addr = 0x6B;
     uint8_t who = 0;
     if (i2c_read_reg(qmi_addr, QMI_WHO_AM_I, &who, 1) != ESP_OK || who != 0x05) {
         qmi_addr = 0x6A;
@@ -479,30 +590,31 @@ static void imu_init(void)
 
 static int imu_log_counter = 0;
 
+static float last_ax = 0, last_ay = 0, last_az = 0;
+static uint32_t imu_err_count = 0;
+
 static void imu_accel(float *ax, float *ay, float *az)
 {
-    // Read STATUS0 first — this latches the data registers
-    uint8_t status = 0;
-    i2c_read_reg(qmi_addr, QMI_STATUS0, &status, 1);
-
     uint8_t raw[6];
     esp_err_t err = i2c_read_reg(qmi_addr, QMI_AX_L, raw, 6);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "IMU read failed: %s", esp_err_to_name(err));
-        *ax = *ay = *az = 0; return;
+        imu_err_count++;
+        *ax = last_ax; *ay = last_ay; *az = last_az;
+        return;
     }
 
     // Dump raw bytes periodically
     if (++imu_log_counter >= 10) {
         imu_log_counter = 0;
-        ESP_LOGI(TAG, "IMU status=0x%02X raw[0x35..0x3A]: %02X %02X %02X %02X %02X %02X",
-                 status, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+        ESP_LOGI(TAG, "IMU raw[0x35..0x3A]: %02X %02X %02X %02X %02X %02X (errs: %lu)",
+                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
+                 (unsigned long)imu_err_count);
     }
 
     // ±4 g range: 1 g = 8192 LSB
-    *ax = (int16_t)((raw[1] << 8) | raw[0]) / 8192.0f;
-    *ay = (int16_t)((raw[3] << 8) | raw[2]) / 8192.0f;
-    *az = (int16_t)((raw[5] << 8) | raw[4]) / 8192.0f;
+    *ax = last_ax = (int16_t)((raw[1] << 8) | raw[0]) / 8192.0f;
+    *ay = last_ay = (int16_t)((raw[3] << 8) | raw[2]) / 8192.0f;
+    *az = last_az = (int16_t)((raw[5] << 8) | raw[4]) / 8192.0f;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -823,7 +935,12 @@ void app_main(void)
         frame_count++;
         int64_t elapsed = now_us - fps_timer_us;
         if (elapsed >= 1000000) {
-            ESP_LOGI(TAG, "FPS: %.1f", frame_count * 1e6f / elapsed);
+            ESP_LOGI(TAG, "FPS: %.1f | I2C tca:%lu qmi:%lu tp:%lu | IMU_ERR: %lu | TE:%lu TP:%lu(s:%lu x:%lu)",
+                     frame_count * 1e6f / elapsed,
+                     (unsigned long)i2c_txn_tca, (unsigned long)i2c_txn_qmi,
+                     (unsigned long)i2c_txn_tp, (unsigned long)imu_err_count,
+                     (unsigned long)te_isr_count, (unsigned long)tp_isr_count,
+                     (unsigned long)tp_serviced_count, (unsigned long)tp_spurious_count);
             frame_count = 0;
             fps_timer_us = now_us;
         }
