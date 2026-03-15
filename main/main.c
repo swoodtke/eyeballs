@@ -323,7 +323,7 @@ static void lcd_init(void)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num        = -1,    // QSPI has no D/C line; cmd embedded in transfer
         .cs_gpio_num        = PIN_LCD_CS,
-        .pclk_hz            = 20 * 1000 * 1000,
+        .pclk_hz            = 80 * 1000 * 1000,
         .lcd_cmd_bits       = 32,
         .lcd_param_bits     = 8,
         .spi_mode           = 3,
@@ -538,17 +538,9 @@ static void te_init(void)
     gpio_isr_handler_add(PIN_LCD_TE, te_isr, NULL);
 }
 
-/** Push the full draw_fb to the display, synced to TE signal. */
+/** Push draw_fb to the display. fb[0]/fb[1] alias draw_fb, so no memcpy needed. */
 static void lcd_flush(void)
 {
-    // Top half
-    memcpy(fb[0], draw_fb,                   LCD_W * HALF_H * sizeof(uint16_t));
-    // Bottom half
-    memcpy(fb[1], draw_fb + LCD_W * HALF_H,  LCD_W * HALF_H * sizeof(uint16_t));
-
-    // Wait for TE pulse (vsync) before sending — eliminates tearing
-    xSemaphoreTake(te_sem, pdMS_TO_TICKS(50));
-
     esp_lcd_panel_draw_bitmap(panel, 0, 0,        LCD_W, HALF_H, fb[0]);
     esp_lcd_panel_draw_bitmap(panel, 0, HALF_H,   LCD_W, LCD_H,  fb[1]);
 }
@@ -767,28 +759,82 @@ static void draw_cat_pupil(int cx, int cy, int h, int w, uint16_t col)
     }
 }
 
+// Precomputed sclera x-spans per row (sclera never moves)
+static int16_t sclera_x0[LCD_H];  // first sclera pixel on row
+static int16_t sclera_x1[LCD_H];  // last sclera pixel on row (inclusive), -1 if none
+
+static void sclera_lut_init(void)
+{
+    const int r = 195;
+    const int r2 = r * r;
+    for (int y = 0; y < LCD_H; y++) {
+        int dy = y - EYE_CY;
+        int dy2 = dy * dy;
+        if (dy2 > r2) {
+            sclera_x0[y] = 0;
+            sclera_x1[y] = -1;
+        } else {
+            int dx = (int)sqrtf((float)(r2 - dy2));
+            sclera_x0[y] = EYE_CX - dx;
+            sclera_x1[y] = EYE_CX + dx;
+            if (sclera_x0[y] < 0) sclera_x0[y] = 0;
+            if (sclera_x1[y] >= LCD_W) sclera_x1[y] = LCD_W - 1;
+        }
+    }
+}
+
 static void eye_draw_cat(void)
 {
-    int px = EYE_CX + (int)eye.px;
-    int py = EYE_CY + (int)eye.py;
+    int ix = EYE_CX + (int)eye.px + (int)eye.rpx;
+    int iy = EYE_CY + (int)eye.py + (int)eye.rpy;
 
-    memset(draw_fb, 0, LCD_PIXELS * sizeof(uint16_t));
-
-    // Sclera (fixed)
-    draw_circle(EYE_CX, EYE_CY, 195, COL_SCLERA);
-
-    // Iris + pupil (rattle together)
-    int ix = px + (int)eye.rpx;
-    int iy = py + (int)eye.rpy;
-    draw_circle(ix, iy, 110, COL_IRIS_RIM);
-    draw_circle(ix, iy, 102, COL_IRIS);
-
-    // Cat-eye pupil — dilates with loudness
     int pupil_w = 16 + (int)(mic_loudness * 70);
-    draw_cat_pupil(ix, iy, 90, pupil_w, COL_PUPIL);
 
-    // Corneal glint
-    draw_circle(ix + 27, iy - 27, 14, COL_GLINT1);
+    for (int y = 0; y < LCD_H; y++) {
+        uint16_t *row = draw_fb + y * LCD_W;
+        int sx0 = sclera_x0[y];
+        int sx1 = sclera_x1[y];
+
+        // Black outside sclera
+        for (int x = 0; x < sx0; x++) row[x] = COL_BLACK;
+        for (int x = sx1 + 1; x < LCD_W; x++) row[x] = COL_BLACK;
+
+        if (sx1 < 0) continue;  // entire row is black
+
+        // Sclera fill
+        for (int x = sx0; x <= sx1; x++) row[x] = COL_SCLERA;
+
+        // Iris rim + iris (smaller, layered on top)
+        int dy_i = y - iy;
+        int dy_i2 = dy_i * dy_i;
+        int rim_r2 = 110 * 110;
+        int iris_r2 = 102 * 102;
+
+        if (dy_i2 <= rim_r2) {
+            int rim_dx = (int)sqrtf((float)(rim_r2 - dy_i2));
+            int x0 = ix - rim_dx; if (x0 < sx0) x0 = sx0;
+            int x1 = ix + rim_dx; if (x1 > sx1) x1 = sx1;
+            for (int x = x0; x <= x1; x++) row[x] = COL_IRIS_RIM;
+
+            if (dy_i2 <= iris_r2) {
+                int iris_dx = (int)sqrtf((float)(iris_r2 - dy_i2));
+                x0 = ix - iris_dx; if (x0 < sx0) x0 = sx0;
+                x1 = ix + iris_dx; if (x1 > sx1) x1 = sx1;
+                for (int x = x0; x <= x1; x++) row[x] = COL_IRIS;
+            }
+        }
+
+        // Cat pupil slit
+        int pupil_h = 90;
+        if (dy_i >= -pupil_h && dy_i <= pupil_h) {
+            float t = (float)dy_i / (float)pupil_h;
+            int hw = (int)(pupil_w * sqrtf(1.0f - t * t));
+            if (hw < 1) hw = 1;
+            int x0 = ix - hw; if (x0 < sx0) x0 = sx0;
+            int x1 = ix + hw; if (x1 > sx1) x1 = sx1;
+            for (int x = x0; x <= x1; x++) row[x] = COL_PUPIL;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -883,13 +929,15 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Eyeball starting up (1.46\" SPD2010)");
 
-    // Full-screen draw buffer in PSRAM (~330 KB)
+    // Single contiguous framebuffer in PSRAM (~330 KB)
+    // draw_fb is the full screen; fb[0]/fb[1] point into top/bottom halves
     draw_fb = heap_caps_malloc(LCD_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-    // Two half-height DMA buffers
-    fb[0] = heap_caps_malloc(LCD_W * HALF_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-    fb[1] = heap_caps_malloc(LCD_W * HALF_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (draw_fb) {
+        fb[0] = draw_fb;
+        fb[1] = draw_fb + LCD_W * HALF_H;
+    }
 
-    if (!draw_fb || !fb[0] || !fb[1]) {
+    if (!draw_fb) {
         ESP_LOGE(TAG, "PSRAM alloc failed! Enable CONFIG_SPIRAM in menuconfig.");
         return;
     }
@@ -904,18 +952,22 @@ void app_main(void)
     imu_init();
     mic_init();
     eye_init();
+    sclera_lut_init();
     spiral_lut_init();
 
     int64_t prev_us = esp_timer_get_time();
 
     int frame_count = 0;
     int64_t fps_timer_us = esp_timer_get_time();
+    int64_t perf_sensor_us = 0, perf_draw_us = 0, perf_flush_us = 0;
 
     while (1) {
         int64_t now_us = esp_timer_get_time();
         float dt = (now_us - prev_us) * 1e-6f;
         prev_us = now_us;
         if (dt > 0.1f) dt = 0.1f;
+
+        int64_t t0 = esp_timer_get_time();
 
         float ax, ay, az;
         imu_accel(&ax, &ay, &az);
@@ -927,22 +979,39 @@ void app_main(void)
                      display_mode == MODE_HYPNOTOAD ? "HYPNOTOAD" : "CAT_EYE");
         }
 
+        int64_t t1 = esp_timer_get_time();
+
         eye_update(ax, ay, az, dt);
         eye_draw();
+
+        int64_t t2 = esp_timer_get_time();
+
         lcd_flush();
+
+        int64_t t3 = esp_timer_get_time();
+
+        perf_sensor_us += (t1 - t0);
+        perf_draw_us   += (t2 - t1);
+        perf_flush_us  += (t3 - t2);
 
         // FPS counter — log every second
         frame_count++;
         int64_t elapsed = now_us - fps_timer_us;
         if (elapsed >= 1000000) {
-            ESP_LOGI(TAG, "FPS: %.1f | I2C tca:%lu qmi:%lu tp:%lu | IMU_ERR: %lu | TE:%lu TP:%lu(s:%lu x:%lu)",
+            float fc = (float)frame_count;
+            ESP_LOGI(TAG, "FPS: %.1f | sensor:%.1fms draw:%.1fms flush:%.1fms",
                      frame_count * 1e6f / elapsed,
+                     perf_sensor_us / fc / 1000.0f,
+                     perf_draw_us / fc / 1000.0f,
+                     perf_flush_us / fc / 1000.0f);
+            ESP_LOGI(TAG, "  I2C tca:%lu qmi:%lu tp:%lu | IMU_ERR: %lu | TE:%lu TP:%lu(s:%lu x:%lu)",
                      (unsigned long)i2c_txn_tca, (unsigned long)i2c_txn_qmi,
                      (unsigned long)i2c_txn_tp, (unsigned long)imu_err_count,
                      (unsigned long)te_isr_count, (unsigned long)tp_isr_count,
                      (unsigned long)tp_serviced_count, (unsigned long)tp_spurious_count);
             frame_count = 0;
             fps_timer_us = now_us;
+            perf_sensor_us = perf_draw_us = perf_flush_us = 0;
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
