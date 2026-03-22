@@ -50,6 +50,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_adc/adc_oneshot.h"
 #include "ble.h"
 
 static const char *TAG = "eye";
@@ -74,6 +75,11 @@ static const char *TAG = "eye";
 #define PIN_MIC_SD     39
 
 #define PIN_TP_INT      4
+
+// Battery / power latch
+#define PIN_BAT_CONTROL 7   // Output LOW = latch battery power ON
+#define PIN_KEY_BAT     6   // Input from PWR button (active low)
+#define PIN_BAT_ADC     8   // Battery voltage ADC (÷3)
 
 // I2C device addresses
 #define TCA9554_ADDR   0x20
@@ -774,10 +780,7 @@ static void eye_update(float ax, float ay, float az, float dt)
 
     // Apply delta-accel as impulse (swapped axes like tilt)
     float da_mag = sqrtf(dax*dax + day*day);
-    if (da_mag > 0.05f) {
-        ESP_LOGI(TAG, "RATTLE: dax=%.3f day=%.3f mag=%.3f rpx=%.1f rpy=%.1f rvx=%.1f rvy=%.1f",
-                 dax, day, da_mag, eye.rpx, eye.rpy, eye.rvx, eye.rvy);
-    }
+    (void)da_mag;
     const float kick = 600.0f;
     eye.rvx +=  day * kick;
     eye.rvy += -dax * kick;
@@ -1117,8 +1120,85 @@ static void eye_draw(void)
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Battery power latch
+// ─────────────────────────────────────────────────────────────────────────────
+static void power_latch_init(void)
+{
+    // Drive BAT_Control LOW to keep P-MOSFET Q1 conducting (battery → VCC)
+    gpio_config_t pwr_cfg = {
+        .pin_bit_mask = (1ULL << PIN_BAT_CONTROL),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pwr_cfg);
+    gpio_set_level(PIN_BAT_CONTROL, 1);
+
+    // PWR button input (active low, internal pull-up)
+    gpio_config_t key_cfg = {
+        .pin_bit_mask = (1ULL << PIN_KEY_BAT),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&key_cfg);
+
+    ESP_LOGI(TAG, "Power latch engaged (GPIO%d LOW)", PIN_BAT_CONTROL);
+}
+
+static void power_off(void)
+{
+    ESP_LOGW(TAG, "Powering off!");
+    gpio_set_level(PIN_BAT_CONTROL, 0);  // Release latch → power cut
+    vTaskDelay(pdMS_TO_TICKS(1000));      // Wait for power to drop
+}
+
+// Battery ADC — GPIO8 has a ÷3 voltage divider, so battery_V = adc_V * 3
+static adc_oneshot_unit_handle_t bat_adc_handle;
+static float battery_voltage = 0;
+static float battery_percent = 0;
+
+static void battery_adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    adc_oneshot_new_unit(&unit_cfg, &bat_adc_handle);
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    // GPIO8 = ADC1_CHANNEL_7 on ESP32-S3
+    adc_oneshot_config_channel(bat_adc_handle, ADC_CHANNEL_7, &chan_cfg);
+}
+
+static float battery_read_voltage(void)
+{
+    int raw = 0;
+    adc_oneshot_read(bat_adc_handle, ADC_CHANNEL_7, &raw);
+    // 12-bit ADC with 12dB attenuation: ~0–3.1V range, ÷3 divider on board
+    float adc_v = raw * 3.1f / 4095.0f;
+    battery_voltage = adc_v * 3.0f;
+
+    // Li-ion approximate charge curve (3.3V=0%, 4.2V=100%)
+    float pct = (battery_voltage - 3.3f) / (4.2f - 3.3f) * 100.0f;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    battery_percent = pct;
+
+    return battery_voltage;
+}
+
+#define PWR_BUTTON_SHUTDOWN_MS  2000  // Hold 2s to power off
+
 void app_main(void)
 {
+    power_latch_init();
+    battery_adc_init();
     ESP_LOGI(TAG, "Eyeball starting up (1.46\" SPD2010)");
 
     // Single contiguous framebuffer in PSRAM (~330 KB)
@@ -1158,10 +1238,13 @@ void app_main(void)
         { 0x0014, "Blink Hold Time",     BLE_PARAM_RW,   &blink_hold_time,       4 },
         { 0x0020, "Mic Loudness",        BLE_PARAM_STAT, &mic_loudness,          4 },
         { 0x0021, "FPS",                 BLE_PARAM_STAT, &current_fps,           4 },
+        { 0x0022, "Battery V",          BLE_PARAM_STAT, &battery_voltage,       4 },
+        { 0x0023, "Battery %",          BLE_PARAM_STAT, &battery_percent,       4 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
     int64_t prev_us = esp_timer_get_time();
+    int64_t pwr_btn_down_since = 0;  // 0 = not pressed
 
     int frame_count = 0;
     int64_t fps_timer_us = esp_timer_get_time();
@@ -1227,9 +1310,23 @@ void app_main(void)
             fps_timer_us = now_us;
             perf_sensor_us = perf_draw_us = perf_flush_us = 0;
 
+            battery_read_voltage();
+            ESP_LOGI(TAG, "PWR: BAT_CTRL(IO7)=%d KEY_BAT(IO6)=%d BAT=%.2fV",
+                     gpio_get_level(PIN_BAT_CONTROL), gpio_get_level(PIN_KEY_BAT),
+                     battery_voltage);
+
             // Sync display_mode from BLE proxy and push notifications
             display_mode = (display_mode_t)ble_display_mode;
             ble_notify_all();
+        }
+
+        // PWR button long-press → power off
+        if (gpio_get_level(PIN_KEY_BAT) == 0) {
+            if (pwr_btn_down_since == 0) pwr_btn_down_since = now_us;
+            else if ((now_us - pwr_btn_down_since) > PWR_BUTTON_SHUTDOWN_MS * 1000LL)
+                power_off();
+        } else {
+            pwr_btn_down_since = 0;
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));

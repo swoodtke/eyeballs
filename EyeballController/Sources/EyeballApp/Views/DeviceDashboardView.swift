@@ -74,13 +74,22 @@ private struct StatView: View {
             Text(entry.label)
             Spacer()
             if let f = entry.floatValue {
-                Text(String(format: "%.2f", f))
+                Text(formatStat(label: entry.label, value: f))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             } else {
                 Text(entry.value.map { String(format: "%02x", $0) }.joined())
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private func formatStat(label: String, value: Float) -> String {
+        switch label {
+        case "Battery %": return String(format: "%.0f%%", value)
+        case "Battery V": return String(format: "%.2fV", value)
+        case "FPS":       return String(format: "%.1f", value)
+        default:          return String(format: "%.2f", value)
         }
     }
 }

@@ -11,6 +11,7 @@ idf_component_register(
         spi_flash
         bt
         nvs_flash
+        esp_adc
 )
  
 target_link_libraries(${COMPONENT_LIB} INTERFACE m)

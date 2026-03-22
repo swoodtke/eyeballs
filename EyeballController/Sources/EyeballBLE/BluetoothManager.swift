@@ -168,6 +168,8 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         case "0014": return "Blink Hold Time"
         case "0020": return "Mic Loudness"
         case "0021": return "FPS"
+        case "0022": return "Battery V"
+        case "0023": return "Battery %"
         default: return "Unknown (\(uuid.uuidString))"
         }
     }
