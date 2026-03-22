@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main.c" "ble.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -9,6 +9,8 @@ idf_component_register(
         esp_lcd
         esp_system
         spi_flash
+        bt
+        nvs_flash
 )
  
 target_link_libraries(${COMPONENT_LIB} INTERFACE m)

@@ -50,6 +50,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "ble.h"
 
 static const char *TAG = "eye";
 
@@ -374,6 +375,8 @@ static void lcd_init(void)
 
 typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD } display_mode_t;
 static display_mode_t display_mode = MODE_CAT_EYE;
+static float current_fps = 0;
+static uint8_t ble_display_mode = 0;
 static int64_t last_touch_us = 0;
 
 static SemaphoreHandle_t tp_sem;
@@ -688,9 +691,67 @@ typedef struct {
 
 static EyeState eye;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Blink / eyelid state
+// ─────────────────────────────────────────────────────────────────────────────
+// Eyelid position: 0.0 = fully open, 1.0 = fully closed
+static float blink_pos = 0;
+// Blink trigger threshold (configurable — will be used for mic, photoresistor, etc.)
+static float blink_loud_threshold = 0.7f;   // mic loudness that triggers a blink
+static float blink_close_speed    = 8.0f;   // how fast eyelid closes (units/sec)
+static float blink_open_speed     = 3.0f;   // how fast eyelid reopens (units/sec)
+static float blink_hold_time      = 0.08f;  // seconds to hold closed
+
+typedef enum { BLINK_OPEN, BLINK_CLOSING, BLINK_HOLD, BLINK_OPENING } blink_state_t;
+static blink_state_t blink_state = BLINK_OPEN;
+static float blink_hold_timer = 0;
+
+/** Call each frame to request a blink. Returns true if a blink was triggered. */
+static bool blink_trigger(void)
+{
+    if (blink_state == BLINK_OPEN) {
+        blink_state = BLINK_CLOSING;
+        return true;
+    }
+    return false;
+}
+
+/** Update blink animation. Call once per frame with dt. */
+static void blink_update(float dt)
+{
+    switch (blink_state) {
+    case BLINK_OPEN:
+        blink_pos = 0;
+        break;
+    case BLINK_CLOSING:
+        blink_pos += blink_close_speed * dt;
+        if (blink_pos >= 1.0f) {
+            blink_pos = 1.0f;
+            blink_state = BLINK_HOLD;
+            blink_hold_timer = blink_hold_time;
+        }
+        break;
+    case BLINK_HOLD:
+        blink_hold_timer -= dt;
+        if (blink_hold_timer <= 0) {
+            blink_state = BLINK_OPENING;
+        }
+        break;
+    case BLINK_OPENING:
+        blink_pos -= blink_open_speed * dt;
+        if (blink_pos <= 0) {
+            blink_pos = 0;
+            blink_state = BLINK_OPEN;
+        }
+        break;
+    }
+}
+
 static void eye_init(void)
 {
     memset(&eye, 0, sizeof(eye));
+    blink_pos = 0;
+    blink_state = BLINK_OPEN;
 }
 
 static int log_counter = 0;
@@ -932,15 +993,38 @@ static void eye_draw_cat(void)
             }
         }
 
-        // Cat pupil slit
-        int pupil_h = 90;
-        if (dy_i >= -pupil_h && dy_i <= pupil_h) {
-            float t = (float)dy_i / (float)pupil_h;
-            int hw = (int)(pupil_w * sqrtf(1.0f - t * t));
-            if (hw < 1) hw = 1;
-            int x0 = ix - hw; if (x0 < sx0) x0 = sx0;
-            int x1 = ix + hw; if (x1 > sx1) x1 = sx1;
+        // Horizontal cat pupil slit (ellipse: semi-major=90 horizontal, semi-minor=pupil_w)
+        int pupil_hw = 90;
+        if (pupil_w > 0 && dy_i >= -pupil_w && dy_i <= pupil_w) {
+            float t = (float)dy_i / (float)pupil_w;
+            int span = (int)(pupil_hw * sqrtf(1.0f - t * t));
+            if (span < 1) span = 1;
+            int x0 = ix - span; if (x0 < sx0) x0 = sx0;
+            int x1 = ix + span; if (x1 > sx1) x1 = sx1;
             for (int x = x0; x <= x1; x++) row[x] = COL_PUPIL;
+        }
+    }
+
+    // Eyelids — close from left and right (screen mounted sideways)
+    if (blink_pos > 0.01f) {
+        int lid_travel = (int)(SCLERA_R * blink_pos);
+        int left_edge  = EYE_CX - SCLERA_R + lid_travel;   // left lid's right edge
+        int right_edge = EYE_CX + SCLERA_R - lid_travel;   // right lid's left edge
+
+        for (int y = 0; y < LCD_H; y++) {
+            int sx0 = sclera_x0[y];
+            int sx1 = sclera_x1[y];
+            if (sx1 < 0) continue;
+
+            uint16_t *row = draw_fb + y * LCD_W;
+            for (int x = sx0; x <= sx1; x++) {
+                if (x <= left_edge || x >= right_edge) {
+                    uint16_t col = COL_SKIN;
+                    if (x >= left_edge - 3 && x <= left_edge)   col = COL_LASH;
+                    if (x >= right_edge && x <= right_edge + 3) col = COL_LASH;
+                    row[x] = col;
+                }
+            }
         }
     }
 }
@@ -1064,6 +1148,19 @@ void app_main(void)
     sclera_lut_init();
     spiral_lut_init();
 
+    // BLE param registry
+    ble_display_mode = (uint8_t)display_mode;
+    static const ble_param_t ble_params[] = {
+        { 0x0010, "Display Mode",        BLE_PARAM_RW,   &ble_display_mode,      1 },
+        { 0x0011, "Blink Threshold",     BLE_PARAM_RW,   &blink_loud_threshold,  4 },
+        { 0x0012, "Blink Close Speed",   BLE_PARAM_RW,   &blink_close_speed,     4 },
+        { 0x0013, "Blink Open Speed",    BLE_PARAM_RW,   &blink_open_speed,      4 },
+        { 0x0014, "Blink Hold Time",     BLE_PARAM_RW,   &blink_hold_time,       4 },
+        { 0x0020, "Mic Loudness",        BLE_PARAM_STAT, &mic_loudness,          4 },
+        { 0x0021, "FPS",                 BLE_PARAM_STAT, &current_fps,           4 },
+    };
+    ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
+
     int64_t prev_us = esp_timer_get_time();
 
     int frame_count = 0;
@@ -1084,9 +1181,16 @@ void app_main(void)
 
         if (touch_check()) {
             display_mode = (display_mode == MODE_CAT_EYE) ? MODE_HYPNOTOAD : MODE_CAT_EYE;
+            ble_display_mode = (uint8_t)display_mode;
             ESP_LOGI(TAG, "Touch! Switching to %s",
                      display_mode == MODE_HYPNOTOAD ? "HYPNOTOAD" : "CAT_EYE");
         }
+
+        // Blink trigger — loud noise (add photoresistor check here later)
+        if (mic_loudness > blink_loud_threshold) {
+            blink_trigger();
+        }
+        blink_update(dt);
 
         int64_t t1 = esp_timer_get_time();
 
@@ -1118,9 +1222,14 @@ void app_main(void)
                      (unsigned long)i2c_txn_tp, (unsigned long)imu_err_count,
                      (unsigned long)te_isr_count, (unsigned long)tp_isr_count,
                      (unsigned long)tp_serviced_count, (unsigned long)tp_spurious_count);
+            current_fps = frame_count * 1e6f / elapsed;
             frame_count = 0;
             fps_timer_us = now_us;
             perf_sensor_us = perf_draw_us = perf_flush_us = 0;
+
+            // Sync display_mode from BLE proxy and push notifications
+            display_mode = (display_mode_t)ble_display_mode;
+            ble_notify_all();
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
