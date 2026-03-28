@@ -100,15 +100,42 @@ static const char *TAG = "eye";
 #define EYE_CX   (LCD_W / 2)
 #define EYE_CY   (LCD_H / 2)
 
+typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD } display_mode_t;
+static display_mode_t display_mode = MODE_CAT_EYE;
+static float current_fps = 0;
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Framebuffer  (412×412×2 = ~330 KB → PSRAM)
-// We split into two half-height buffers so esp_lcd can DMA one while we draw
-// into the other (double-buffer approach).
+// Framebuffer  (412×412×2 = ~330 KB each → PSRAM, double-buffered)
+// Core 1 renders into the back buffer while Core 0 DMA-flushes the front.
 // ─────────────────────────────────────────────────────────────────────────────
 #define HALF_H   (LCD_H / 2)
-static uint16_t *fb[2];     // fb[0] = top half, fb[1] = bottom half
-static uint16_t *draw_fb;   // flat full-screen buffer we draw into
+static uint16_t *framebuf[2];   // two full-screen buffers in PSRAM
+static uint16_t *draw_fb;       // points to whichever buffer the render task writes
+static int front_idx = 0;
+static int back_idx  = 1;
 static esp_lcd_panel_handle_t panel;
+
+// Dual-core synchronisation
+static SemaphoreHandle_t render_done_sem;  // Core 1 → Core 0: frame rendered
+static SemaphoreHandle_t flush_done_sem;   // Core 0 → Core 1: back buffer safe
+
+// Snapshot of all render inputs passed from Core 0 → Core 1
+typedef struct {
+    float px, py;
+    float rpx, rpy;
+    float blink_pos;
+    float mic_loudness;
+    display_mode_t display_mode;
+    float spiral_phase;
+    float spiral_zoom;
+    uint8_t spiral_color_a[3];
+    uint8_t spiral_color_b[3];
+    uint8_t spiral_color_c[3];
+    uint8_t spiral_color_d[3];
+    uint16_t *target_fb;
+} render_params_t;
+
+static render_params_t render_params;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Colour helpers — byte-swapped RGB565 for little-endian DMA to big-endian LCD
@@ -379,9 +406,6 @@ static void lcd_init(void)
 // Touch — direct I2C to SPD2010 integrated touch controller (addr 0x53)
 // ─────────────────────────────────────────────────────────────────────────────
 
-typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD } display_mode_t;
-static display_mode_t display_mode = MODE_CAT_EYE;
-static float current_fps = 0;
 static uint8_t ble_display_mode = 0;
 static int64_t last_touch_us = 0;
 
@@ -547,9 +571,14 @@ static void te_init(void)
     gpio_isr_handler_add(PIN_LCD_TE, te_isr, NULL);
 }
 
-/** Push draw_fb to the display. fb[0]/fb[1] alias draw_fb, so no memcpy needed. */
+/** Push front buffer to the display and block until DMA is fully complete. */
+static uint16_t *fb[2];  // half-height aliases into front buffer, set at flush time
+
+/** Push front buffer to display. Blocking — returns after DMA is complete. */
 static void lcd_flush(void)
 {
+    fb[0] = framebuf[front_idx];
+    fb[1] = framebuf[front_idx] + LCD_W * HALF_H;
     esp_lcd_panel_draw_bitmap(panel, 0, 0,        LCD_W, HALF_H, fb[0]);
     esp_lcd_panel_draw_bitmap(panel, 0, HALF_H,   LCD_W, LCD_H,  fb[1]);
 }
@@ -605,7 +634,7 @@ static void imu_accel(float *ax, float *ay, float *az)
     }
 
     // Dump raw bytes periodically
-    if (++imu_log_counter >= 10) {
+    if (++imu_log_counter >= 200) {
         imu_log_counter = 0;
         ESP_LOGI(TAG, "IMU raw[0x35..0x3A]: %02X %02X %02X %02X %02X %02X (errs: %lu)",
                  raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
@@ -801,7 +830,7 @@ static void eye_update(float ax, float ay, float az, float dt)
 
     // Log every 10 frames
     int64_t now = esp_timer_get_time();
-    if (++log_counter >= 10) {
+    if (++log_counter >= 200) {
         log_counter = 0;
         ESP_LOGI(TAG, "t=%lld dt=%.1fms | IMU: ax=%.3f ay=%.3f az=%.3f | "
                  "pos=(%.1f,%.1f) | loud=%.3f",
@@ -1117,16 +1146,13 @@ static void eye_draw_hypnotoad(void)
     }
 
     draw_circle(EYE_CX, EYE_CY, 20, COL_PUPIL);
-
-    spiral_phase += spiral_speed;
-    if (spiral_phase > 1.0f) spiral_phase -= 1.0f;
 }
 
 static int mode_log_counter = 0;
 
 static void eye_draw(void)
 {
-    if (++mode_log_counter >= 10) {
+    if (++mode_log_counter >= 200) {
         mode_log_counter = 0;
         ESP_LOGI(TAG, "mode=%s", display_mode == MODE_HYPNOTOAD ? "HYPNOTOAD" : "CAT_EYE");
     }
@@ -1137,8 +1163,35 @@ static void eye_draw(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Entry point
+// Render task — runs on Core 1, draws into the back buffer
 // ─────────────────────────────────────────────────────────────────────────────
+static void render_task(void *arg)
+{
+    while (1) {
+        xSemaphoreTake(flush_done_sem, portMAX_DELAY);
+
+        // Copy snapshot into globals so existing draw functions work unchanged
+        draw_fb       = render_params.target_fb;
+        eye.px        = render_params.px;
+        eye.py        = render_params.py;
+        eye.rpx       = render_params.rpx;
+        eye.rpy       = render_params.rpy;
+        blink_pos     = render_params.blink_pos;
+        mic_loudness  = render_params.mic_loudness;
+        display_mode  = render_params.display_mode;
+        spiral_phase  = render_params.spiral_phase;
+        spiral_zoom   = render_params.spiral_zoom;
+        memcpy(spiral_color_a, render_params.spiral_color_a, 3);
+        memcpy(spiral_color_b, render_params.spiral_color_b, 3);
+        memcpy(spiral_color_c, render_params.spiral_color_c, 3);
+        memcpy(spiral_color_d, render_params.spiral_color_d, 3);
+
+        eye_draw();
+
+        xSemaphoreGive(render_done_sem);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Battery power latch
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1224,20 +1277,21 @@ void app_main(void)
     battery_adc_init();
     ESP_LOGI(TAG, "Eyeball starting up (1.46\" SPD2010)");
 
-    // Single contiguous framebuffer in PSRAM (~330 KB)
-    // draw_fb is the full screen; fb[0]/fb[1] point into top/bottom halves
-    draw_fb = heap_caps_malloc(LCD_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-    if (draw_fb) {
-        fb[0] = draw_fb;
-        fb[1] = draw_fb + LCD_W * HALF_H;
-    }
+    // Double framebuffers in PSRAM (~660 KB total)
+    framebuf[0] = heap_caps_malloc(LCD_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    framebuf[1] = heap_caps_malloc(LCD_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    draw_fb = framebuf[0];
 
-    if (!draw_fb) {
+    if (!framebuf[0] || !framebuf[1]) {
         ESP_LOGE(TAG, "PSRAM alloc failed! Enable CONFIG_SPIRAM in menuconfig.");
         return;
     }
-    ESP_LOGI(TAG, "Framebuffers: %.1f KB in PSRAM",
-             (float)(LCD_PIXELS + LCD_W * LCD_H) * 2.0f / 1024.0f);
+    ESP_LOGI(TAG, "Double framebuffers: %.1f KB in PSRAM",
+             LCD_PIXELS * 2.0f * 2.0f / 1024.0f);
+
+    // Create dual-core sync semaphores
+    render_done_sem = xSemaphoreCreateBinary();
+    flush_done_sem  = xSemaphoreCreateBinary();
 
     i2c_init();
     tca9554_init();
@@ -1273,12 +1327,29 @@ void app_main(void)
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
+    // Launch render task on Core 1
+    xTaskCreatePinnedToCore(render_task, "render", 8192, NULL, 5, NULL, 1);
+
+    // Bootstrap first frame: snapshot params and signal render task
+    render_params.target_fb    = framebuf[back_idx];
+    render_params.display_mode = display_mode;
+    render_params.spiral_phase = spiral_phase;
+    render_params.spiral_zoom  = spiral_zoom;
+    memcpy(render_params.spiral_color_a, spiral_color_a, 3);
+    memcpy(render_params.spiral_color_b, spiral_color_b, 3);
+    memcpy(render_params.spiral_color_c, spiral_color_c, 3);
+    memcpy(render_params.spiral_color_d, spiral_color_d, 3);
+    xSemaphoreGive(flush_done_sem);
+
     int64_t prev_us = esp_timer_get_time();
-    int64_t pwr_btn_down_since = 0;  // 0 = not pressed
+    int64_t pwr_btn_down_since = 0;
 
     int frame_count = 0;
     int64_t fps_timer_us = esp_timer_get_time();
-    int64_t perf_sensor_us = 0, perf_draw_us = 0, perf_flush_us = 0;
+    int64_t perf_wait_us = 0, perf_flush_us = 0, perf_sensor_us = 0;
+
+    // Render first frame synchronously so we have something to flush
+    xSemaphoreTake(render_done_sem, portMAX_DELAY);
 
     while (1) {
         int64_t now_us = esp_timer_get_time();
@@ -1288,6 +1359,12 @@ void app_main(void)
 
         int64_t t0 = esp_timer_get_time();
 
+        // --- Swap and flush the just-rendered frame (Core 1 is idle here) ---
+        front_idx = back_idx;
+        back_idx  = 1 - front_idx;
+
+        // Snapshot params and kick off Core 1 BEFORE flushing
+        // so rendering overlaps with the DMA flush
         float ax, ay, az;
         imu_accel(&ax, &ay, &az);
         mic_read_loudness();
@@ -1299,37 +1376,61 @@ void app_main(void)
                      display_mode == MODE_HYPNOTOAD ? "HYPNOTOAD" : "CAT_EYE");
         }
 
-        // Blink trigger — loud noise (add photoresistor check here later)
         if (mic_loudness > blink_loud_threshold) {
             blink_trigger();
         }
         blink_update(dt);
+        eye_update(ax, ay, az, dt);
+
+        spiral_phase += spiral_speed;
+        if (spiral_phase > 1.0f) spiral_phase -= 1.0f;
+
+        display_mode = (display_mode_t)ble_display_mode;
+
+        render_params.px           = eye.px;
+        render_params.py           = eye.py;
+        render_params.rpx          = eye.rpx;
+        render_params.rpy          = eye.rpy;
+        render_params.blink_pos    = blink_pos;
+        render_params.mic_loudness = mic_loudness;
+        render_params.display_mode = display_mode;
+        render_params.spiral_phase = spiral_phase;
+        render_params.spiral_zoom  = spiral_zoom;
+        memcpy(render_params.spiral_color_a, spiral_color_a, 3);
+        memcpy(render_params.spiral_color_b, spiral_color_b, 3);
+        memcpy(render_params.spiral_color_c, spiral_color_c, 3);
+        memcpy(render_params.spiral_color_d, spiral_color_d, 3);
+        render_params.target_fb    = framebuf[back_idx];
+
+        // Start Core 1 rendering into back buffer
+        xSemaphoreGive(flush_done_sem);
 
         int64_t t1 = esp_timer_get_time();
 
-        eye_update(ax, ay, az, dt);
-        eye_draw();
+        // Flush front buffer — Core 1 is rendering in parallel
+        lcd_flush();
 
         int64_t t2 = esp_timer_get_time();
 
-        lcd_flush();
+        // --- Wait for Core 1 to finish rendering ---
+        xSemaphoreTake(render_done_sem, portMAX_DELAY);
 
         int64_t t3 = esp_timer_get_time();
 
+        // --- Perf tracking ---
         perf_sensor_us += (t1 - t0);
-        perf_draw_us   += (t2 - t1);
-        perf_flush_us  += (t3 - t2);
+        perf_flush_us  += (t2 - t1);
+        perf_wait_us   += (t3 - t2);
 
-        // FPS counter — log every second
         frame_count++;
         int64_t elapsed = now_us - fps_timer_us;
-        if (elapsed >= 1000000) {
+        if (elapsed >= 5000000) {
             float fc = (float)frame_count;
-            ESP_LOGI(TAG, "FPS: %.1f | sensor:%.1fms draw:%.1fms flush:%.1fms",
+            ESP_LOGI(TAG, "FPS: %.1f | sensor:%.1fms flush:%.1fms wait:%.1fms",
                      frame_count * 1e6f / elapsed,
                      perf_sensor_us / fc / 1000.0f,
-                     perf_draw_us / fc / 1000.0f,
-                     perf_flush_us / fc / 1000.0f);
+                     perf_flush_us / fc / 1000.0f,
+                     perf_wait_us / fc / 1000.0f);
             ESP_LOGI(TAG, "  I2C tca:%lu qmi:%lu tp:%lu | IMU_ERR: %lu | TE:%lu TP:%lu(s:%lu x:%lu)",
                      (unsigned long)i2c_txn_tca, (unsigned long)i2c_txn_qmi,
                      (unsigned long)i2c_txn_tp, (unsigned long)imu_err_count,
@@ -1338,15 +1439,13 @@ void app_main(void)
             current_fps = frame_count * 1e6f / elapsed;
             frame_count = 0;
             fps_timer_us = now_us;
-            perf_sensor_us = perf_draw_us = perf_flush_us = 0;
+            perf_sensor_us = perf_flush_us = perf_wait_us = 0;
 
             battery_read_voltage();
             ESP_LOGI(TAG, "PWR: BAT_CTRL(IO7)=%d KEY_BAT(IO6)=%d BAT=%.2fV (raw=%.0f adc=%.3fV)",
                      gpio_get_level(PIN_BAT_CONTROL), gpio_get_level(PIN_KEY_BAT),
                      battery_voltage, bat_adc_raw, bat_adc_raw * 3.1f / 4095.0f);
 
-            // Sync display_mode from BLE proxy and push notifications
-            display_mode = (display_mode_t)ble_display_mode;
             ble_notify_all();
         }
 
@@ -1358,7 +1457,5 @@ void app_main(void)
         } else {
             pwr_btn_down_since = 0;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
