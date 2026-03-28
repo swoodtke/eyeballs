@@ -9,6 +9,7 @@
 
 // Convenience combos
 #define BLE_PARAM_RW     (BLE_PARAM_F_READ | BLE_PARAM_F_WRITE)
+#define BLE_PARAM_RWN    (BLE_PARAM_F_READ | BLE_PARAM_F_WRITE | BLE_PARAM_F_NOTIFY)
 #define BLE_PARAM_STAT   (BLE_PARAM_F_READ | BLE_PARAM_F_NOTIFY)
 
 typedef struct {

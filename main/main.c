@@ -1036,70 +1036,89 @@ static void eye_draw_cat(void)
 // Hypnotoad spiral
 // ─────────────────────────────────────────────────────────────────────────────
 static float spiral_phase = 0;
+static float spiral_zoom  = 15.0f;  // log-spiral zoom factor
+static float spiral_speed = 0.08f;  // rotation speed per frame
 
-// Spiral colour palette — alternating bands
-#define COL_SPIRAL_A  rgb(255,  50,   0)   // red-orange
-#define COL_SPIRAL_B  rgb(255, 220,   0)   // yellow
-#define COL_SPIRAL_C  rgb( 20, 180,  20)   // green
-#define COL_SPIRAL_D  rgb(255, 120,   0)   // orange
+// Spiral colours — 4 bands, each stored as RGB bytes for BLE writeability
+static uint8_t spiral_color_a[3] = {   0, 200, 180 };  // teal
+static uint8_t spiral_color_b[3] = {  30, 120, 255 };  // blue
+static uint8_t spiral_color_c[3] = {  80,  40, 220 };  // indigo
+static uint8_t spiral_color_d[3] = { 160,  30, 200 };  // violet
 
-// Precomputed lookup tables for spiral (avoid per-pixel atan2f/sqrtf)
-static uint8_t *spiral_lut = NULL;  // angle*256/(2*PI) + dist_scaled per pixel
+// Precomputed LUTs for spiral — store angle and log-dist separately
+// so zoom can be applied at draw time without trig
+static uint8_t *spiral_angle_lut = NULL;  // angle_component * 256
+static uint8_t *spiral_dist_lut  = NULL;  // log(dist) * 256 (pre-scaled by 1.0)
+static uint8_t *spiral_mask      = NULL;  // 1 = inside circle, 0 = outside
 
 static void spiral_lut_init(void)
 {
-    // Store (angle_component + dist_component) * 4 as uint8_t for each pixel
-    // We only need it mod 4, so store as fixed-point and use at draw time
-    spiral_lut = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
-    if (!spiral_lut) {
+    spiral_angle_lut = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
+    spiral_dist_lut  = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
+    spiral_mask      = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
+    if (!spiral_angle_lut || !spiral_dist_lut || !spiral_mask) {
         ESP_LOGE(TAG, "Spiral LUT alloc failed");
         return;
     }
-    const float band_width = 40.0f;
     for (int y = 0; y < LCD_H; y++) {
         for (int x = 0; x < LCD_W; x++) {
+            int i = y * LCD_W + x;
             float dx = x - EYE_CX;
             float dy = y - EYE_CY;
             float dist_sq = dx * dx + dy * dy;
             if (dist_sq > 195.0f * 195.0f) {
-                spiral_lut[y * LCD_W + x] = 0xFF; // outside circle marker
+                spiral_mask[i] = 0;
+                spiral_angle_lut[i] = 0;
+                spiral_dist_lut[i] = 0;
                 continue;
             }
+            spiral_mask[i] = 1;
             float dist = sqrtf(dist_sq);
             float angle = atan2f(dy, dx);
-            // Encode as fixed-point: (angle/(2*PI) + dist/band_width) * 256
-            float val = (angle / (2.0f * M_PI) + dist / band_width) * 256.0f;
-            // Store lower 8 bits (wraps naturally)
-            spiral_lut[y * LCD_W + x] = (uint8_t)((int)val & 0xFF);
+            // Store angle as fixed-point 0–255
+            spiral_angle_lut[i] = (uint8_t)((int)(angle / (2.0f * M_PI) * 256.0f) & 0xFF);
+            // Store log(dist) as fixed-point for log-spiral (bands widen toward edge)
+            float log_d = (dist > 1.0f) ? logf(dist) : 0;
+            // log(195) ≈ 5.27, scale to use full 0–255 range
+            spiral_dist_lut[i] = (uint8_t)((int)(log_d * 48.0f) & 0xFF);
         }
     }
-    ESP_LOGI(TAG, "Spiral LUT ready");
+    ESP_LOGI(TAG, "Spiral LUT ready (split angle/dist)");
 }
 
 static void eye_draw_hypnotoad(void)
 {
-    if (!spiral_lut) return;
+    if (!spiral_angle_lut) return;
 
-    const uint16_t palette[] = { COL_SPIRAL_A, COL_SPIRAL_B, COL_SPIRAL_C, COL_SPIRAL_D };
-    // Phase offset as fixed-point matching LUT encoding
+    uint16_t palette[4] = {
+        rgb(spiral_color_a[0], spiral_color_a[1], spiral_color_a[2]),
+        rgb(spiral_color_b[0], spiral_color_b[1], spiral_color_b[2]),
+        rgb(spiral_color_c[0], spiral_color_c[1], spiral_color_c[2]),
+        rgb(spiral_color_d[0], spiral_color_d[1], spiral_color_d[2]),
+    };
+
     uint8_t phase_offset = (uint8_t)((int)(spiral_phase * 256.0f) & 0xFF);
+    // dist_lut stores log(dist)*48. We want: dist_component = log(dist)*zoom*256/(2*PI)
+    // = dist_lut * zoom * 256 / (48 * 2 * PI)
+    // ≈ dist_lut * zoom * 0.8488
+    uint16_t zoom_mult = (uint16_t)(spiral_zoom * 256.0f * 256.0f / (48.0f * 2.0f * 3.14159f));
 
     uint16_t black = COL_BLACK;
     for (int i = 0; i < LCD_PIXELS; i++) {
-        uint8_t lut_val = spiral_lut[i];
-        if (lut_val == 0xFF) {
+        if (!spiral_mask[i]) {
             draw_fb[i] = black;
         } else {
-            // Subtract phase to make spiral move outward, divide by 64 for 4 bands
-            uint8_t band = ((lut_val - phase_offset) >> 6) & 0x03;
+            uint8_t ang = spiral_angle_lut[i];
+            uint8_t dist_val = (uint8_t)((spiral_dist_lut[i] * zoom_mult) >> 8);
+            uint8_t combined = ang + dist_val - phase_offset;
+            uint8_t band = (combined >> 6) & 0x03;
             draw_fb[i] = palette[band];
         }
     }
 
-    // Dark pupil in centre
-    draw_circle(EYE_CX, EYE_CY, 30, COL_PUPIL);
+    draw_circle(EYE_CX, EYE_CY, 20, COL_PUPIL);
 
-    spiral_phase += 0.08f;
+    spiral_phase += spiral_speed;
     if (spiral_phase > 1.0f) spiral_phase -= 1.0f;
 }
 
@@ -1176,13 +1195,17 @@ static void battery_adc_init(void)
     adc_oneshot_config_channel(bat_adc_handle, ADC_CHANNEL_7, &chan_cfg);
 }
 
+static float bat_adc_raw = 0;
+
 static float battery_read_voltage(void)
 {
-    int raw = 0;
-    adc_oneshot_read(bat_adc_handle, ADC_CHANNEL_7, &raw);
-    // 12-bit ADC with 12dB attenuation: ~0–3.1V range, ÷3 divider on board
-    float adc_v = raw * 3.1f / 4095.0f;
-    battery_voltage = adc_v * 3.0f;
+    int raw_int = 0;
+    adc_oneshot_read(bat_adc_handle, ADC_CHANNEL_7, &raw_int);
+    bat_adc_raw = (float)raw_int;
+    // 12-bit ADC with 12dB attenuation: ~0–3.1V range
+    // Calibrated: charge LED off (full=4.2V) when raw≈1520, so multiplier=3.6
+    float adc_v = raw_int * 3.1f / 4095.0f;
+    battery_voltage = adc_v * 3.6f;
 
     // Li-ion approximate charge curve (3.3V=0%, 4.2V=100%)
     float pct = (battery_voltage - 3.3f) / (4.2f - 3.3f) * 100.0f;
@@ -1231,15 +1254,22 @@ void app_main(void)
     // BLE param registry
     ble_display_mode = (uint8_t)display_mode;
     static const ble_param_t ble_params[] = {
-        { 0x0010, "Display Mode",        BLE_PARAM_RW,   &ble_display_mode,      1 },
+        { 0x0010, "Display Mode",        BLE_PARAM_RWN,  &ble_display_mode,      1 },
         { 0x0011, "Blink Threshold",     BLE_PARAM_RW,   &blink_loud_threshold,  4 },
         { 0x0012, "Blink Close Speed",   BLE_PARAM_RW,   &blink_close_speed,     4 },
         { 0x0013, "Blink Open Speed",    BLE_PARAM_RW,   &blink_open_speed,      4 },
         { 0x0014, "Blink Hold Time",     BLE_PARAM_RW,   &blink_hold_time,       4 },
+        { 0x0015, "Spiral Zoom",        BLE_PARAM_RW,   &spiral_zoom,           4 },
+        { 0x0016, "Spiral Speed",       BLE_PARAM_RW,   &spiral_speed,          4 },
+        { 0x0017, "Spiral Color A",     BLE_PARAM_RW,   &spiral_color_a,        3 },
+        { 0x0018, "Spiral Color B",     BLE_PARAM_RW,   &spiral_color_b,        3 },
+        { 0x0019, "Spiral Color C",     BLE_PARAM_RW,   &spiral_color_c,        3 },
+        { 0x001A, "Spiral Color D",     BLE_PARAM_RW,   &spiral_color_d,        3 },
         { 0x0020, "Mic Loudness",        BLE_PARAM_STAT, &mic_loudness,          4 },
         { 0x0021, "FPS",                 BLE_PARAM_STAT, &current_fps,           4 },
         { 0x0022, "Battery V",          BLE_PARAM_STAT, &battery_voltage,       4 },
         { 0x0023, "Battery %",          BLE_PARAM_STAT, &battery_percent,       4 },
+        { 0x0024, "BAT ADC Raw",       BLE_PARAM_STAT, &bat_adc_raw,           4 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
@@ -1311,9 +1341,9 @@ void app_main(void)
             perf_sensor_us = perf_draw_us = perf_flush_us = 0;
 
             battery_read_voltage();
-            ESP_LOGI(TAG, "PWR: BAT_CTRL(IO7)=%d KEY_BAT(IO6)=%d BAT=%.2fV",
+            ESP_LOGI(TAG, "PWR: BAT_CTRL(IO7)=%d KEY_BAT(IO6)=%d BAT=%.2fV (raw=%.0f adc=%.3fV)",
                      gpio_get_level(PIN_BAT_CONTROL), gpio_get_level(PIN_KEY_BAT),
-                     battery_voltage);
+                     battery_voltage, bat_adc_raw, bat_adc_raw * 3.1f / 4095.0f);
 
             // Sync display_mode from BLE proxy and push notifications
             display_mode = (display_mode_t)ble_display_mode;

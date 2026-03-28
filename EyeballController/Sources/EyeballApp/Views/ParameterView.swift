@@ -13,6 +13,8 @@ struct ParameterView: View {
             EmptyView()
         } else if entry.value.count == 1 {
             uint8Control
+        } else if entry.value.count == 3 && entry.isWritable {
+            colorControl
         } else if entry.value.count == 4 {
             floatControl
         } else {
@@ -84,6 +86,36 @@ struct ParameterView: View {
         }
     }
 
+    @ViewBuilder
+    private var colorControl: some View {
+        let color = Binding<Color>(
+            get: {
+                let d = entry.value
+                guard d.count >= 3 else { return .white }
+                return Color(
+                    red: Double(d[0]) / 255.0,
+                    green: Double(d[1]) / 255.0,
+                    blue: Double(d[2]) / 255.0
+                )
+            },
+            set: { newColor in
+                guard let components = NSColor(newColor).usingColorSpace(.sRGB) else { return }
+                let r = UInt8(clamping: Int(components.redComponent * 255))
+                let g = UInt8(clamping: Int(components.greenComponent * 255))
+                let b = UInt8(clamping: Int(components.blueComponent * 255))
+                let data = Data([r, g, b])
+                bluetooth.write(data: data, to: entry, on: device)
+                entry.value = data
+            }
+        )
+        HStack {
+            Text(entry.label)
+            Spacer()
+            ColorPicker("", selection: color, supportsOpacity: false)
+                .labelsHidden()
+        }
+    }
+
     private var rawView: some View {
         HStack {
             Text(entry.label)
@@ -106,6 +138,8 @@ struct ParameterView: View {
         case "0012": return (1.0, 20.0)     // Close speed
         case "0013": return (0.5, 10.0)     // Open speed
         case "0014": return (0.01, 0.5)     // Hold time
+        case "0015": return (10.0, 20.0)     // Spiral zoom
+        case "0016": return (0.03, 0.12)     // Spiral speed
         default: return (0.0, 100.0)
         }
     }

@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 import EyeballBLE
 
 struct DeviceDashboardView: View {
@@ -7,6 +8,7 @@ struct DeviceDashboardView: View {
     @State private var editingName = false
     @State private var newName = ""
     @FocusState private var nameFieldFocused: Bool
+    @State private var logTimer: Timer?
 
     var body: some View {
         Form {
@@ -37,9 +39,9 @@ struct DeviceDashboardView: View {
                 }
             }
 
-            if !device.parameters.isEmpty {
+            if !device.modeParameters.isEmpty {
                 Section("Parameters") {
-                    ForEach(device.parameters) { entry in
+                    ForEach(device.modeParameters) { entry in
                         ParameterView(entry: entry, device: device)
                             .environmentObject(bluetooth)
                     }
@@ -56,6 +58,23 @@ struct DeviceDashboardView: View {
         }
         .formStyle(.grouped)
         .navigationTitle(device.name)
+        .onAppear { startBatteryLog() }
+        .onDisappear { logTimer?.invalidate(); logTimer = nil }
+    }
+
+    private func startBatteryLog() {
+        logBattery()
+        logTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            logBattery()
+        }
+    }
+
+    private func logBattery() {
+        let voltage = device.characteristics.first { $0.label == "Battery V" }?.floatValue ?? 0
+        let percent = device.characteristics.first { $0.label == "Battery %" }?.floatValue ?? 0
+        let raw = device.characteristics.first { $0.label == "BAT ADC Raw" }?.floatValue ?? 0
+        let ts = ISO8601DateFormatter().string(from: Date())
+        print("\(ts) BAT: \(String(format: "%.2fV", voltage)) \(String(format: "%.0f%%", percent)) raw=\(String(format: "%.0f", raw))")
     }
 
     private func saveName() {
@@ -88,7 +107,8 @@ private struct StatView: View {
         switch label {
         case "Battery %": return String(format: "%.0f%%", value)
         case "Battery V": return String(format: "%.2fV", value)
-        case "FPS":       return String(format: "%.1f", value)
+        case "FPS":         return String(format: "%.1f", value)
+        case "BAT ADC Raw": return String(format: "%.0f", value)
         default:          return String(format: "%.2f", value)
         }
     }

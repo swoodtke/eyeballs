@@ -166,10 +166,17 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         case "0012": return "Blink Close Speed"
         case "0013": return "Blink Open Speed"
         case "0014": return "Blink Hold Time"
+        case "0015": return "Spiral Zoom"
+        case "0016": return "Spiral Speed"
+        case "0017": return "Spiral Color A"
+        case "0018": return "Spiral Color B"
+        case "0019": return "Spiral Color C"
+        case "001A": return "Spiral Color D"
         case "0020": return "Mic Loudness"
         case "0021": return "FPS"
         case "0022": return "Battery V"
         case "0023": return "Battery %"
+        case "0024": return "BAT ADC Raw"
         default: return "Unknown (\(uuid.uuidString))"
         }
     }

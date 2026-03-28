@@ -179,6 +179,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg);
 
 static void start_advertising(void)
 {
+    // Ensure GAP name is current before every advertising start
+    ble_svc_gap_device_name_set(device_name);
+
     struct ble_gap_adv_params adv_params = {
         .conn_mode = BLE_GAP_CONN_MODE_UND,
         .disc_mode = BLE_GAP_DISC_MODE_GEN,
@@ -296,9 +299,10 @@ void ble_init(const ble_param_t *params, int count)
     ble_hs_cfg.sync_cb  = ble_on_sync;
     ble_hs_cfg.reset_cb = ble_on_reset;
 
-    ble_svc_gap_device_name_set(device_name);
     ble_svc_gap_init();
     ble_svc_gatt_init();
+    // Set name AFTER gap_init, otherwise gap_init overwrites it with "nimble"
+    ble_svc_gap_device_name_set(device_name);
 
     build_gatt_table();
 

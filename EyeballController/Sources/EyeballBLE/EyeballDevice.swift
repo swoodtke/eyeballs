@@ -1,3 +1,4 @@
+import Combine
 import CoreBluetooth
 import Foundation
 
@@ -49,7 +50,10 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
     @Published public var name: String
     @Published public var isConnecting: Bool = false
     @Published public var isConnected: Bool = false
-    @Published public var characteristics: [CharacteristicEntry] = []
+    @Published public var characteristics: [CharacteristicEntry] = [] {
+        didSet { subscribeToCharacteristics() }
+    }
+    private var characteristicSubs: Set<AnyCancellable> = []
 
     public init(peripheral: CBPeripheral) {
         self.id = peripheral.identifier
@@ -62,13 +66,47 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
         characteristics.filter { $0.isNotifiable && !$0.isWritable }
     }
 
-    /// Parameters = read + write (no notify).
+    /// All writable parameters.
     public var parameters: [CharacteristicEntry] {
         characteristics.filter { $0.isWritable }
+    }
+
+    private static let catEyeUUIDs: Set<String> = ["0011", "0012", "0013", "0014"]
+    private static let hypnotoadUUIDs: Set<String> = ["0015", "0016", "0017", "0018", "0019", "001A"]
+    private static let globalUUIDs: Set<String> = ["0010"]  // Display Mode
+
+    /// Parameters for the current display mode + global params.
+    public var modeParameters: [CharacteristicEntry] {
+        let mode = displayMode
+        return parameters.filter { entry in
+            let uuid = entry.id.uuidString
+            if Self.globalUUIDs.contains(uuid) { return true }
+            if uuid == "0001" { return false }  // device name handled separately
+            switch mode {
+            case 0: return Self.catEyeUUIDs.contains(uuid)
+            case 1: return Self.hypnotoadUUIDs.contains(uuid)
+            default: return true
+            }
+        }
+    }
+
+    /// Current display mode (0=Cat Eye, 1=Hypnotoad).
+    public var displayMode: UInt8 {
+        characteristics.first { $0.id == CBUUID(string: "0010") }?.uint8Value ?? 0
     }
 
     /// The device name characteristic (UUID 0x0001).
     public var deviceNameEntry: CharacteristicEntry? {
         characteristics.first { $0.id == CBUUID(string: "0001") }
+    }
+
+    private func subscribeToCharacteristics() {
+        characteristicSubs.removeAll()
+        for entry in characteristics {
+            entry.$value
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.objectWillChange.send() }
+                .store(in: &characteristicSubs)
+        }
     }
 }
