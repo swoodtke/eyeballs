@@ -7,29 +7,44 @@
 - **IO expander**: TCA9554 (also I2C) — controls LCD reset pin
 
 ## What it does
-| Gesture | Eye |
+| Gesture / Input | Effect |
 |---|---|
 | Tilt board | Pupil follows gravity |
-| Jump / tap desk | Eye blinks |
+| Jump / tap desk | Eye blinks (mic-triggered) |
+| Touch display | Toggle between Cat Eye and Hypnotoad modes |
 | Idle | Random saccade every 2–5 s |
+
+### Eye modes
+- **Cat Eye** — realistic eye with iris texture, sclera shading, and spring-physics pupil tracking
+- **Hypnotoad** — rotating log-spiral with 4 configurable color bands
+
+### BLE Controller App (macOS)
+A SwiftUI app in `EyeballController/` connects to one or more eyeball devices via BLE and provides:
+- Live stats (FPS, battery voltage/%, mic loudness)
+- Mode-specific parameter controls (blink settings for cat eye, spiral zoom/speed/colors for hypnotoad)
+- Device renaming (persisted to NVS flash)
+- Mode switching that syncs bidirectionally with on-device touch
 
 ## Build & flash
 
+### Firmware (ESP32)
 ```bash
-. $IDF_PATH/export.sh          # ESP-IDF v5.1+
+. $IDF_PATH/export.sh          # ESP-IDF v5.x
 
-cd eyeball
 idf.py set-target esp32s3
 
-# This fetches the SPD2010 driver from the ESP Component Registry:
+# First time only — fetches the SPD2010 driver from ESP Component Registry:
 idf.py update-dependencies
-
-idf.py menuconfig
-# Verify: Component config → ESP PSRAM → Support for external SPI RAM = ON
-#         Set to Octal mode, 80 MHz
 
 idf.py build
 idf.py -p /dev/cu.usbserial-* flash monitor
+```
+
+### Controller app (macOS)
+```bash
+cd EyeballController
+swift build
+swift run EyeballApp
 ```
 
 ## Key differences from the 1.28" GC9A01 version
