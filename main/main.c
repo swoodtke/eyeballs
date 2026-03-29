@@ -100,7 +100,7 @@ static const char *TAG = "eye";
 #define EYE_CX   (LCD_W / 2)
 #define EYE_CY   (LCD_H / 2)
 
-typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD } display_mode_t;
+typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_BLOB_EYE } display_mode_t;
 static display_mode_t display_mode = MODE_CAT_EYE;
 static float current_fps = 0;
 
@@ -132,6 +132,9 @@ typedef struct {
     uint8_t spiral_color_b[3];
     uint8_t spiral_color_c[3];
     uint8_t spiral_color_d[3];
+    float blob_pulse;
+    uint8_t blob_color_a[3];
+    uint8_t blob_color_b[3];
     uint16_t *target_fb;
 } render_params_t;
 
@@ -532,7 +535,7 @@ static bool touch_check(void)
 
         // Debounce
         int64_t now = esp_timer_get_time();
-        if (now - last_touch_us > 500000) {
+        if (now - last_touch_us > 1500000) {  // 1.5s debounce (blob init takes ~1s)
             last_touch_us = now;
             return true;
         }
@@ -868,8 +871,15 @@ static uint16_t sclera_shade[SHADE_LUT_SIZE];
 #define IRIS_TEX_SIZE (2 * IRIS_TEX_R + 1)
 static uint16_t *iris_tex;  // IRIS_TEX_SIZE * IRIS_TEX_SIZE entries in PSRAM
 
+static void cat_eye_free(void)
+{
+    if (iris_tex) { heap_caps_free(iris_tex); iris_tex = NULL; }
+    ESP_LOGI(TAG, "Cat eye resources freed");
+}
+
 static void iris_tex_init(void)
 {
+    if (iris_tex) return;  // already initialized
     const int sz = IRIS_TEX_SIZE * IRIS_TEX_SIZE;
     iris_tex = heap_caps_malloc(sz * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     if (!iris_tex) {
@@ -1082,6 +1092,7 @@ static uint8_t *spiral_mask      = NULL;  // 1 = inside circle, 0 = outside
 
 static void spiral_lut_init(void)
 {
+    if (spiral_angle_lut) return;  // already initialized
     spiral_angle_lut = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
     spiral_dist_lut  = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
     spiral_mask      = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
@@ -1113,6 +1124,14 @@ static void spiral_lut_init(void)
         }
     }
     ESP_LOGI(TAG, "Spiral LUT ready (split angle/dist)");
+}
+
+static void spiral_lut_free(void)
+{
+    if (spiral_angle_lut) { heap_caps_free(spiral_angle_lut); spiral_angle_lut = NULL; }
+    if (spiral_dist_lut)  { heap_caps_free(spiral_dist_lut);  spiral_dist_lut = NULL; }
+    if (spiral_mask)      { heap_caps_free(spiral_mask);      spiral_mask = NULL; }
+    ESP_LOGI(TAG, "Spiral LUT freed");
 }
 
 static void eye_draw_hypnotoad(void)
@@ -1148,16 +1167,246 @@ static void eye_draw_hypnotoad(void)
     draw_circle(EYE_CX, EYE_CY, 20, COL_PUPIL);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Blob eye — pre-rendered animation playback
+// ─────────────────────────────────────────────────────────────────────────────
+static float blob_speed = 1.0f;
+static float blob_pulse_threshold = 0.7f;
+static float blob_pulse = 0;
+static uint8_t blob_color_a[3] = { 255, 120,   0 };  // tint color (unused for now)
+static uint8_t blob_color_b[3] = {  12,   2,   1 };  // background tint (unused for now)
+
+// Pre-rendered frames read from "blobdata" flash partition into PSRAM
+#include "esp_partition.h"
+
+static uint16_t blob_palette_rgb565[64];
+static uint8_t *blob_all_frames = NULL;  // all decoded frames in PSRAM
+static int blob_frame_w, blob_frame_h, blob_num_frames;
+static int blob_frame_idx = 0;
+static int blob_frame_dir = 1;  // 1=forward, -1=reverse (ping-pong)
+static bool blob_inited = false;
+
+// Decode a 6-bit RLE bitstream into pixel buffer
+static void blob_decode_rle(const uint8_t *comp, int comp_size, uint8_t *out, int num_pixels)
+{
+    int bit_pos = 0;
+    int px = 0;
+
+    #define READ6() ({ \
+        int _byte = bit_pos >> 3; \
+        int _bit  = bit_pos & 7; \
+        bit_pos += 6; \
+        ((comp[_byte] << _bit) | (comp[_byte + 1] >> (8 - _bit))) >> 2 & 0x3F; \
+    })
+
+    while (px < num_pixels) {
+        int v = READ6();
+        if (v != 0) {
+            out[px++] = v;
+        } else {
+            int color = READ6();
+            int count = READ6();
+            if (count == 0) count = 1;
+            int end = px + count;
+            if (end > num_pixels) end = num_pixels;
+            memset(out + px, color, end - px);
+            px = end;
+        }
+    }
+    #undef READ6
+}
+
+static void blob_init(void)
+{
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, 0x40, "blobdata");
+    if (!part) {
+        ESP_LOGE(TAG, "Blob partition 'blobdata' not found!");
+        return;
+    }
+
+    // Read header (16 bytes)
+    uint8_t hdr[16];
+    esp_partition_read(part, 0, hdr, 16);
+    blob_frame_w    = hdr[0] | (hdr[1] << 8);
+    blob_frame_h    = hdr[2] | (hdr[3] << 8);
+    blob_num_frames = hdr[4] | (hdr[5] << 8);
+    int pal_size    = hdr[6] | (hdr[7] << 8);
+
+    // Read palette
+    uint8_t pal_rgb[64 * 3];
+    esp_partition_read(part, 16, pal_rgb, pal_size * 3);
+    for (int i = 0; i < pal_size; i++)
+        blob_palette_rgb565[i] = rgb(pal_rgb[i * 3], pal_rgb[i * 3 + 1], pal_rgb[i * 3 + 2]);
+
+    // Read frame offset table
+    int offset_table_pos = 16 + pal_size * 3;
+    uint32_t *offsets = heap_caps_malloc(blob_num_frames * 4, MALLOC_CAP_SPIRAM);
+    if (!offsets) {
+        ESP_LOGE(TAG, "Blob offset table alloc failed");
+        return;
+    }
+    esp_partition_read(part, offset_table_pos, offsets, blob_num_frames * 4);
+
+    // Allocate all decoded frames in PSRAM
+    int frame_pixels = blob_frame_w * blob_frame_h;
+    int total = frame_pixels * blob_num_frames;
+    blob_all_frames = heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
+    if (!blob_all_frames) {
+        ESP_LOGE(TAG, "Blob frames PSRAM alloc failed (%d bytes)", total);
+        heap_caps_free(offsets);
+        return;
+    }
+
+    // Temp buffer for compressed data (reused per frame)
+    int max_comp = frame_pixels;  // worst case
+    uint8_t *comp_buf = heap_caps_malloc(max_comp + 2, MALLOC_CAP_SPIRAM);
+    if (!comp_buf) {
+        ESP_LOGE(TAG, "Blob comp buffer alloc failed");
+        heap_caps_free(offsets);
+        heap_caps_free(blob_all_frames);
+        blob_all_frames = NULL;
+        return;
+    }
+    memset(comp_buf, 0, max_comp + 2);
+
+    // Decode all frames at boot
+    for (int f = 0; f < blob_num_frames; f++) {
+        int comp_size;
+        if (f + 1 < blob_num_frames)
+            comp_size = offsets[f + 1] - offsets[f];
+        else
+            comp_size = max_comp;
+        if (comp_size > max_comp) comp_size = max_comp;
+
+        esp_partition_read(part, offsets[f], comp_buf, comp_size);
+        blob_decode_rle(comp_buf, comp_size,
+                        blob_all_frames + f * frame_pixels, frame_pixels);
+    }
+
+    heap_caps_free(comp_buf);
+    heap_caps_free(offsets);
+
+    blob_inited = true;
+    ESP_LOGI(TAG, "Blob: %d×%d, %d frames decoded (%.1f MB PSRAM)",
+             blob_frame_w, blob_frame_h, blob_num_frames,
+             total / (1024.0f * 1024.0f));
+}
+
+static void blob_free(void)
+{
+    if (blob_all_frames) { heap_caps_free(blob_all_frames); blob_all_frames = NULL; }
+    blob_inited = false;
+    ESP_LOGI(TAG, "Blob frames freed");
+}
+
+static void eye_draw_blob(void)
+{
+    if (!blob_inited) blob_init();
+    if (!blob_all_frames) return;
+
+    if (!blob_all_frames) return;
+    const uint8_t *frame = blob_all_frames +
+        blob_frame_idx * blob_frame_w * blob_frame_h;
+    uint16_t bg = blob_palette_rgb565[0];
+    uint16_t black = COL_BLACK;
+
+    // 2× nearest-neighbor upscale: 250×200 → 500×400, centered and cropped
+    int scaled_w = blob_frame_w * 2;
+    int scaled_h = blob_frame_h * 2;
+    int ox = (LCD_W - scaled_w) / 2;  // negative if scaled > display
+    int oy = (LCD_H - scaled_h) / 2;
+
+    int eye_r2 = 195 * 195;  // same radius as spiral_mask used
+
+    for (int y = 0; y < LCD_H; y++) {
+        int row = y * LCD_W;
+        int dy = y - EYE_CY;
+        int dy2 = dy * dy;
+        int sy = y - oy;  // position in scaled image
+        int fy = sy >> 1; // source row (divide by 2)
+        int in_frame_y = (sy >= 0 && sy < scaled_h && fy < blob_frame_h);
+        const uint8_t *frame_row = in_frame_y ? frame + fy * blob_frame_w : NULL;
+
+        for (int x = 0; x < LCD_W; x++) {
+            int i = row + x;
+            int dx = x - EYE_CX;
+            if (dx * dx + dy2 > eye_r2) {
+                draw_fb[i] = black;
+            } else if (frame_row) {
+                int sx = x - ox;
+                int fx = sx >> 1;
+                if (sx >= 0 && sx < scaled_w && fx < blob_frame_w)
+                    draw_fb[i] = blob_palette_rgb565[frame_row[fx]];
+                else
+                    draw_fb[i] = bg;
+            } else {
+                draw_fb[i] = bg;
+            }
+        }
+    }
+
+    // Advance frame — ping-pong playback
+    blob_frame_idx += blob_frame_dir;
+    if (blob_frame_idx >= blob_num_frames - 1) {
+        blob_frame_dir = -1;
+    } else if (blob_frame_idx <= 0) {
+        blob_frame_dir = 1;
+    }
+}
+
 static int mode_log_counter = 0;
+static const char *mode_name(display_mode_t m) {
+    switch (m) {
+        case MODE_CAT_EYE:   return "CAT_EYE";
+        case MODE_HYPNOTOAD: return "HYPNOTOAD";
+        case MODE_BLOB_EYE:  return "BLOB_EYE";
+        default:             return "UNKNOWN";
+    }
+}
+
+static display_mode_t active_mode = MODE_CAT_EYE;
+
+static void eye_mode_switch(display_mode_t new_mode)
+{
+    if (new_mode == active_mode) return;
+
+    // Free old mode resources
+    switch (active_mode) {
+        case MODE_CAT_EYE:   cat_eye_free(); break;
+        case MODE_HYPNOTOAD: spiral_lut_free(); break;
+        case MODE_BLOB_EYE:  blob_free(); break;
+    }
+
+    // Init new mode resources
+    switch (new_mode) {
+        case MODE_CAT_EYE:   iris_tex_init(); sclera_lut_init(); break;
+        case MODE_HYPNOTOAD: spiral_lut_init(); break;
+        case MODE_BLOB_EYE:  blob_init(); break;
+    }
+
+    active_mode = new_mode;
+    ESP_LOGI(TAG, "Mode switch: %s → resources loaded", mode_name(new_mode));
+}
 
 static void eye_draw(void)
 {
+    if (display_mode != active_mode) {
+        // Clear screen — this frame gets flushed as black while resources load
+        for (int i = 0; i < LCD_PIXELS; i++)
+            draw_fb[i] = COL_BLACK;
+        eye_mode_switch(display_mode);
+        return;  // show black frame; next call draws the new mode
+    }
+
     if (++mode_log_counter >= 200) {
         mode_log_counter = 0;
-        ESP_LOGI(TAG, "mode=%s", display_mode == MODE_HYPNOTOAD ? "HYPNOTOAD" : "CAT_EYE");
+        ESP_LOGI(TAG, "mode=%s", mode_name(display_mode));
     }
     if (display_mode == MODE_HYPNOTOAD)
         eye_draw_hypnotoad();
+    else if (display_mode == MODE_BLOB_EYE)
+        eye_draw_blob();
     else
         eye_draw_cat();
 }
@@ -1185,6 +1434,9 @@ static void render_task(void *arg)
         memcpy(spiral_color_b, render_params.spiral_color_b, 3);
         memcpy(spiral_color_c, render_params.spiral_color_c, 3);
         memcpy(spiral_color_d, render_params.spiral_color_d, 3);
+        blob_pulse    = render_params.blob_pulse;
+        memcpy(blob_color_a, render_params.blob_color_a, 3);
+        memcpy(blob_color_b, render_params.blob_color_b, 3);
 
         eye_draw();
 
@@ -1301,9 +1553,10 @@ void app_main(void)
     imu_init();
     mic_init();
     eye_init();
+    // Mode resources are loaded on demand by eye_mode_switch() in eye_draw()
+    // Init cat eye as the default starting mode
     iris_tex_init();
     sclera_lut_init();
-    spiral_lut_init();
 
     // BLE param registry
     ble_display_mode = (uint8_t)display_mode;
@@ -1319,6 +1572,10 @@ void app_main(void)
         { 0x0018, "Spiral Color B",     BLE_PARAM_RW,   &spiral_color_b,        3 },
         { 0x0019, "Spiral Color C",     BLE_PARAM_RW,   &spiral_color_c,        3 },
         { 0x001A, "Spiral Color D",     BLE_PARAM_RW,   &spiral_color_d,        3 },
+        { 0x001B, "Blob Speed",        BLE_PARAM_RW,   &blob_speed,            4 },
+        { 0x001E, "Blob Pulse Thresh",BLE_PARAM_RW,   &blob_pulse_threshold,  4 },
+        { 0x001C, "Blob Color A",      BLE_PARAM_RW,   &blob_color_a,          3 },
+        { 0x001D, "Blob Color B",      BLE_PARAM_RW,   &blob_color_b,          3 },
         { 0x0020, "Mic Loudness",        BLE_PARAM_STAT, &mic_loudness,          4 },
         { 0x0021, "FPS",                 BLE_PARAM_STAT, &current_fps,           4 },
         { 0x0022, "Battery V",          BLE_PARAM_STAT, &battery_voltage,       4 },
@@ -1339,6 +1596,9 @@ void app_main(void)
     memcpy(render_params.spiral_color_b, spiral_color_b, 3);
     memcpy(render_params.spiral_color_c, spiral_color_c, 3);
     memcpy(render_params.spiral_color_d, spiral_color_d, 3);
+    render_params.blob_pulse   = blob_pulse;
+    memcpy(render_params.blob_color_a, blob_color_a, 3);
+    memcpy(render_params.blob_color_b, blob_color_b, 3);
     xSemaphoreGive(flush_done_sem);
 
     int64_t prev_us = esp_timer_get_time();
@@ -1370,10 +1630,9 @@ void app_main(void)
         mic_read_loudness();
 
         if (touch_check()) {
-            display_mode = (display_mode == MODE_CAT_EYE) ? MODE_HYPNOTOAD : MODE_CAT_EYE;
+            display_mode = (display_mode_t)((display_mode + 1) % 3);
             ble_display_mode = (uint8_t)display_mode;
-            ESP_LOGI(TAG, "Touch! Switching to %s",
-                     display_mode == MODE_HYPNOTOAD ? "HYPNOTOAD" : "CAT_EYE");
+            ESP_LOGI(TAG, "Touch! Switching to %s", mode_name(display_mode));
         }
 
         if (mic_loudness > blink_loud_threshold) {
@@ -1384,6 +1643,15 @@ void app_main(void)
 
         spiral_phase += spiral_speed;
         if (spiral_phase > 1.0f) spiral_phase -= 1.0f;
+        // Blob pulse — trigger on loud noise, decay quickly
+        if (mic_loudness > blob_pulse_threshold && blob_pulse < 0.1f) {
+            blob_pulse = 1.0f;
+            ESP_LOGI(TAG, "Blob pulse! loud=%.3f thresh=%.3f", mic_loudness, blob_pulse_threshold);
+        }
+        if (blob_pulse > 0) {
+            blob_pulse -= dt * 2.0f;  // decay over ~0.5s
+            if (blob_pulse < 0) blob_pulse = 0;
+        }
 
         display_mode = (display_mode_t)ble_display_mode;
 
@@ -1400,6 +1668,9 @@ void app_main(void)
         memcpy(render_params.spiral_color_b, spiral_color_b, 3);
         memcpy(render_params.spiral_color_c, spiral_color_c, 3);
         memcpy(render_params.spiral_color_d, spiral_color_d, 3);
+        render_params.blob_pulse   = blob_pulse;
+        memcpy(render_params.blob_color_a, blob_color_a, 3);
+        memcpy(render_params.blob_color_b, blob_color_b, 3);
         render_params.target_fb    = framebuf[back_idx];
 
         // Start Core 1 rendering into back buffer

@@ -12,6 +12,7 @@ idf_component_register(
         bt
         nvs_flash
         esp_adc
+        esp_partition
 )
- 
+
 target_link_libraries(${COMPONENT_LIB} INTERFACE m)

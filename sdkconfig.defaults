@@ -10,6 +10,10 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=n
 # Flash size
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
+# Custom partition table (larger app partition for embedded blob frames)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
 # Optimisation
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 

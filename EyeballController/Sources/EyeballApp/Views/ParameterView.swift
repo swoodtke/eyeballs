@@ -127,7 +127,7 @@ struct ParameterView: View {
 
     private func displayModeNames(for entry: CharacteristicEntry) -> [String]? {
         switch entry.id.uuidString {
-        case "0010": return ["Cat Eye", "Hypnotoad"]
+        case "0010": return ["Cat Eye", "Hypnotoad", "Blob Eye"]
         default: return nil
         }
     }
@@ -140,6 +140,8 @@ struct ParameterView: View {
         case "0014": return (0.01, 0.5)     // Hold time
         case "0015": return (10.0, 20.0)     // Spiral zoom
         case "0016": return (0.03, 0.12)     // Spiral speed
+        case "001B": return (0.2, 3.0)       // Blob speed
+        case "001E": return (0.0, 1.0)       // Blob pulse threshold
         default: return (0.0, 100.0)
         }
     }

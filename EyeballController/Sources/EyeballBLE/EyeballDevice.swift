@@ -73,6 +73,7 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
 
     private static let catEyeUUIDs: Set<String> = ["0011", "0012", "0013", "0014"]
     private static let hypnotoadUUIDs: Set<String> = ["0015", "0016", "0017", "0018", "0019", "001A"]
+    private static let blobEyeUUIDs: Set<String> = ["001B", "001C", "001D", "001E"]
     private static let globalUUIDs: Set<String> = ["0010"]  // Display Mode
 
     /// Parameters for the current display mode + global params.
@@ -85,6 +86,7 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
             switch mode {
             case 0: return Self.catEyeUUIDs.contains(uuid)
             case 1: return Self.hypnotoadUUIDs.contains(uuid)
+            case 2: return Self.blobEyeUUIDs.contains(uuid)
             default: return true
             }
         }

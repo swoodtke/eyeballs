@@ -28,7 +28,7 @@ static const ble_uuid128_t svc_uuid = BLE_UUID128_INIT(
 #define CHR_UUID_DEVICE_NAME  0x0001
 
 #define MAX_DEVICE_NAME  20
-#define MAX_PARAMS       16
+#define MAX_PARAMS       24
 #define NVS_NAMESPACE    "eyeball"
 #define NVS_KEY_NAME     "dev_name"
 
