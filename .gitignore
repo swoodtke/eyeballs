@@ -1,0 +1,6 @@
+sdkconfig
+build/
+managed_components/
+dependencies.lock
+EyeballController/.build/
+output/
