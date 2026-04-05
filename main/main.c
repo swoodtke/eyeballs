@@ -1,28 +1,12 @@
 /**
  * @file main.c
- * @brief Animated eyeball – Waveshare ESP32-S3-Touch-LCD-1.46
+ * @brief Animated eyeball – dual-board support
  *
- * Hardware summary
- * ─────────────────────────────────────────────────────────────
- * Display  : SPD2010, 412×412 round AMOLED, QSPI (4 data lines)
- * IMU      : QMI8658, I2C address 0x6B (or 0x6A)
- * IO expdr : TCA9554, I2C address 0x20 — controls LCD_RST & TP_RST
+ * Supported boards (auto-detected at runtime):
+ *   1.46" : ESP32-S3-Touch-LCD-1.46   — SPD2010, 412×412
+ *   1.75" : ESP32-S3-Touch-AMOLED-1.75 — CO5300,  466×466
  *
- * Pin map (from Waveshare schematic / Spotpear wiki)
- * ─────────────────────────────────────────────────────────────
- *  QSPI  LCD_SDA0 → GPIO46   LCD_SDA1 → GPIO45
- *        LCD_SDA2 → GPIO42   LCD_SDA3 → GPIO41
- *        LCD_SCK  → GPIO40   LCD_CS   → GPIO21
- *        LCD_TE   → GPIO18   LCD_BL   → GPIO5
- *        LCD_RST  → TCA9554 EXIO2 (via I2C)
- *
- *  I2C   SDA → GPIO11   SCL → GPIO10   (shared: IMU, touch, RTC, expander)
- *
- * Behaviour
- * ─────────────────────────────────────────────────────────────
- *  Tilt board       → pupil follows gravity (spring-damper physics)
- *  Jump / tap       → blink (sharp ΔZ from accelerometer)
- *  Idle > 2-5 s     → random saccade (quick flick to a new position)
+ * See board_config.h for pin maps, GPIO overlap warnings, and detection logic.
  */
 
 #include <stdio.h>
@@ -46,59 +30,29 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_spd2010.h"
+#include "esp_lcd_co5300.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_adc/adc_oneshot.h"
 #include "ble.h"
+#include "board_config.h"
 
 static const char *TAG = "eye";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pin definitions
-// ─────────────────────────────────────────────────────────────────────────────
-#define PIN_LCD_SDA0   46
-#define PIN_LCD_SDA1   45
-#define PIN_LCD_SDA2   42
-#define PIN_LCD_SDA3   41
-#define PIN_LCD_SCK    40
-#define PIN_LCD_CS     21
-#define PIN_LCD_TE     18
-#define PIN_LCD_BL      5
-
-#define PIN_I2C_SDA    11
-#define PIN_I2C_SCL    10
-
-#define PIN_MIC_WS      2
-#define PIN_MIC_SCK    15
-#define PIN_MIC_SD     39
-
-#define PIN_TP_INT      4
-
-// Battery / power latch
-#define PIN_BAT_CONTROL 7   // Output LOW = latch battery power ON
-#define PIN_KEY_BAT     6   // Input from PWR button (active low)
-#define PIN_BAT_ADC     8   // Battery voltage ADC (÷3)
+// Board config — set once at boot by detect_board(), used everywhere
+static const board_config_t *board;
+static int lcd_pixels;  // board->lcd_w * board->lcd_h, set once
 
 // I2C device addresses
 #define TCA9554_ADDR   0x20
-#define TP_ADDR        0x53
 #define TCA9554_INPUT  0x00
 #define TCA9554_OUTPUT 0x01
 #define TCA9554_CFG    0x03
-// EXIO bit positions on TCA9554 (from schematic)
+// EXIO bit positions on TCA9554 (from 1.46" schematic — only used when lcd_rst_via_tca)
 #define EXIO_TP_RST    (1 << 1)   // EXIO1
 #define EXIO_LCD_RST   (1 << 2)   // EXIO2
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Display geometry
-// ─────────────────────────────────────────────────────────────────────────────
-#define LCD_W     412
-#define LCD_H     412
-#define LCD_PIXELS (LCD_W * LCD_H)
-#define EYE_CX   (LCD_W / 2)
-#define EYE_CY   (LCD_H / 2)
 
 typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_BLOB_EYE, MODE_SAURON } display_mode_t;
 #define NUM_MODES 4
@@ -106,10 +60,9 @@ static display_mode_t display_mode = MODE_CAT_EYE;
 static float current_fps = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Framebuffer  (412×412×2 = ~330 KB each → PSRAM, double-buffered)
+// Framebuffer  (double-buffered in PSRAM, sized at runtime from board config)
 // Core 1 renders into the back buffer while Core 0 DMA-flushes the front.
 // ─────────────────────────────────────────────────────────────────────────────
-#define HALF_H   (LCD_H / 2)
 static uint16_t *framebuf[2];   // two full-screen buffers in PSRAM
 static uint16_t *draw_fb;       // points to whichever buffer the render task writes
 static int front_idx = 0;
@@ -170,16 +123,16 @@ static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
 // ─────────────────────────────────────────────────────────────────────────────
 static inline void fb_set(int x, int y, uint16_t col)
 {
-    if ((unsigned)x < LCD_W && (unsigned)y < LCD_H)
-        draw_fb[y * LCD_W + x] = col;
+    if ((unsigned)x < (unsigned)board->lcd_w && (unsigned)y < (unsigned)board->lcd_h)
+        draw_fb[y * board->lcd_w + x] = col;
 }
 
 static inline void hline(int x0, int x1, int y, uint16_t col)
 {
-    if ((unsigned)y >= LCD_H) return;
-    if (x0 < 0)        x0 = 0;
-    if (x1 >= LCD_W)   x1 = LCD_W - 1;
-    uint16_t *row = draw_fb + y * LCD_W;
+    if ((unsigned)y >= (unsigned)board->lcd_h) return;
+    if (x0 < 0)              x0 = 0;
+    if (x1 >= board->lcd_w)  x1 = board->lcd_w - 1;
+    uint16_t *row = draw_fb + y * board->lcd_w;
     for (int x = x0; x <= x1; x++) row[x] = col;
 }
 
@@ -199,12 +152,13 @@ static void draw_circle(int cx, int cy, int r, uint16_t col)
 
 static void draw_hband(int y0, int y1, uint16_t col)
 {
-    if (y0 < 0)        y0 = 0;
-    if (y1 >= LCD_H)   y1 = LCD_H - 1;
+    const int W = board->lcd_w, H = board->lcd_h;
+    if (y0 < 0)   y0 = 0;
+    if (y1 >= H)   y1 = H - 1;
     if (y0 > y1) return;
-    uint16_t *row = draw_fb + y0 * LCD_W;
-    for (int r = y0; r <= y1; r++, row += LCD_W)
-        for (int x = 0; x < LCD_W; x++)
+    uint16_t *row = draw_fb + y0 * W;
+    for (int r = y0; r <= y1; r++, row += W)
+        for (int x = 0; x < W; x++)
             row[x] = col;
 }
 
@@ -221,9 +175,9 @@ static uint8_t qmi_addr = 0x6B;   // resolved at runtime in imu_init
 
 static void i2c_count(uint8_t addr)
 {
-    if (addr == TCA9554_ADDR)  i2c_txn_tca++;
-    else if (addr == qmi_addr) i2c_txn_qmi++;
-    else if (addr == TP_ADDR)  i2c_txn_tp++;
+    if (addr == TCA9554_ADDR)       i2c_txn_tca++;
+    else if (addr == qmi_addr)      i2c_txn_qmi++;
+    else if (addr == board->tp_addr) i2c_txn_tp++;
 }
 
 #ifdef USE_NEW_I2C_API
@@ -236,8 +190,8 @@ static void i2c_init(void)
     memset(i2c_devs, 0, sizeof(i2c_devs));
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
-        .sda_io_num = PIN_I2C_SDA,
-        .scl_io_num = PIN_I2C_SCL,
+        .sda_io_num = board->pin_i2c_sda,
+        .scl_io_num = board->pin_i2c_scl,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .flags.enable_internal_pullup = true,
     };
@@ -277,8 +231,8 @@ static void i2c_init(void)
 {
     i2c_config_t cfg = {
         .mode             = I2C_MODE_MASTER,
-        .sda_io_num       = PIN_I2C_SDA,
-        .scl_io_num       = PIN_I2C_SCL,
+        .sda_io_num       = board->pin_i2c_sda,
+        .scl_io_num       = board->pin_i2c_scl,
         .sda_pullup_en    = GPIO_PULLUP_ENABLE,
         .scl_pullup_en    = GPIO_PULLUP_ENABLE,
         .master.clk_speed = 400000,
@@ -339,76 +293,143 @@ static void tca9554_set(uint8_t mask, bool high)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LCD init using esp_lcd + espressif/esp_lcd_spd2010 component
+// LCD init — supports SPD2010 (1.46") and CO5300 (1.75")
 // ─────────────────────────────────────────────────────────────────────────────
+
+// CO5300 init command data (must be at file scope for static const)
+static const uint8_t co5300_d_fe20[]  = {0x20};
+static const uint8_t co5300_d_19[]    = {0x10};
+static const uint8_t co5300_d_1c[]    = {0xA0};
+static const uint8_t co5300_d_fe00[]  = {0x00};
+static const uint8_t co5300_d_c4[]    = {0x80};
+static const uint8_t co5300_d_3a[]    = {0x55};
+static const uint8_t co5300_d_35[]    = {0x00};
+static const uint8_t co5300_d_53[]    = {0x20};
+static const uint8_t co5300_d_51[]    = {0xFF};
+static const uint8_t co5300_d_63[]    = {0xFF};
+static const uint8_t co5300_d_2a[]    = {0x00, 0x06, 0x01, 0xD7};
+static const uint8_t co5300_d_2b[]    = {0x00, 0x00, 0x01, 0xD1};
+
+static const co5300_lcd_init_cmd_t co5300_init_cmds[] = {
+    {0xFE, co5300_d_fe20, 1, 0},
+    {0x19, co5300_d_19,   1, 0},
+    {0x1C, co5300_d_1c,   1, 0},
+    {0xFE, co5300_d_fe00, 1, 0},
+    {0xC4, co5300_d_c4,   1, 0},
+    {0x3A, co5300_d_3a,   1, 0},   // COLMOD 16bpp
+    {0x35, co5300_d_35,   1, 0},   // TE on
+    {0x53, co5300_d_53,   1, 0},   // Brightness control
+    {0x51, co5300_d_51,   1, 0},   // Max brightness
+    {0x63, co5300_d_63,   1, 0},
+    {0x2A, co5300_d_2a,   4, 0},   // CASET
+    {0x2B, co5300_d_2b,   4, 600}, // RASET
+    {0x11, NULL,          0, 600}, // Sleep out
+    {0x29, NULL,          0, 0},   // Display on
+};
+
 static void lcd_init(void)
 {
-    // Backlight off during init
-    gpio_config_t bl_cfg = {
-        .pin_bit_mask = (1ULL << PIN_LCD_BL),
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    gpio_config(&bl_cfg);
-    gpio_set_level(PIN_LCD_BL, 0);
+    // Backlight off during init (only 1.46" has a backlight GPIO)
+    if (board->has_backlight_gpio) {
+        gpio_config_t bl_cfg = {
+            .pin_bit_mask = (1ULL << board->pin_lcd_bl),
+            .mode = GPIO_MODE_OUTPUT,
+        };
+        gpio_config(&bl_cfg);
+        gpio_set_level(board->pin_lcd_bl, 0);
+    }
 
-    // Hardware reset via TCA9554 expander
-    tca9554_set(EXIO_LCD_RST, false);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    tca9554_set(EXIO_LCD_RST, true);
-    vTaskDelay(pdMS_TO_TICKS(120));
+    // Hardware reset
+    if (board->lcd_rst_via_tca) {
+        // 1.46": reset via TCA9554 IO expander
+        tca9554_set(EXIO_LCD_RST, false);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        tca9554_set(EXIO_LCD_RST, true);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    } else {
+        // 1.75": reset via direct GPIO
+        gpio_config_t rst_cfg = {
+            .pin_bit_mask = (1ULL << board->pin_lcd_rst),
+            .mode = GPIO_MODE_OUTPUT,
+        };
+        gpio_config(&rst_cfg);
+        gpio_set_level(board->pin_lcd_rst, 0);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        gpio_set_level(board->pin_lcd_rst, 1);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    int half_h = board->lcd_h / 2;
 
     // Create QSPI panel IO
     esp_lcd_panel_io_handle_t io_handle;
     esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num        = -1,    // QSPI has no D/C line; cmd embedded in transfer
-        .cs_gpio_num        = PIN_LCD_CS,
+        .dc_gpio_num        = -1,
+        .cs_gpio_num        = board->pin_lcd_cs,
         .pclk_hz            = 80 * 1000 * 1000,
         .lcd_cmd_bits       = 32,
         .lcd_param_bits     = 8,
-        .spi_mode           = 3,
+        .spi_mode           = board->spi_mode,
         .trans_queue_depth  = 10,
         .flags = {
             .quad_mode = true,
         },
     };
 
-    // SPI bus config for QSPI
     spi_bus_config_t bus_cfg = {
-        .data0_io_num   = PIN_LCD_SDA0,
-        .data1_io_num   = PIN_LCD_SDA1,
-        .data2_io_num   = PIN_LCD_SDA2,
-        .data3_io_num   = PIN_LCD_SDA3,
-        .sclk_io_num    = PIN_LCD_SCK,
-        .max_transfer_sz = LCD_W * HALF_H * sizeof(uint16_t),
+        .data0_io_num   = board->pin_lcd_sda0,
+        .data1_io_num   = board->pin_lcd_sda1,
+        .data2_io_num   = board->pin_lcd_sda2,
+        .data3_io_num   = board->pin_lcd_sda3,
+        .sclk_io_num    = board->pin_lcd_sck,
+        .max_transfer_sz = board->lcd_w * (board->lcd_h / 4) * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
                                               &io_config, &io_handle));
 
-    // Create SPD2010 panel
-    spd2010_vendor_config_t vendor_cfg = {
-        .flags = {
-            .use_qspi_interface = 1,
-        },
-    };
-    esp_lcd_panel_dev_config_t panel_cfg = {
-        .reset_gpio_num = -1,   // reset handled via TCA9554 above
-        .data_endian    = LCD_RGB_DATA_ENDIAN_BIG,
-        .bits_per_pixel = 16,
-        .vendor_config  = &vendor_cfg,
-    };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_spd2010(io_handle, &panel_cfg, &panel));
+    if (board->use_spd2010) {
+        // ── SPD2010 (1.46") ──
+        spd2010_vendor_config_t vendor_cfg = {
+            .flags = { .use_qspi_interface = 1 },
+        };
+        esp_lcd_panel_dev_config_t panel_cfg = {
+            .reset_gpio_num = -1,
+            .data_endian    = LCD_RGB_DATA_ENDIAN_BIG,
+            .bits_per_pixel = 16,
+            .vendor_config  = &vendor_cfg,
+        };
+        ESP_ERROR_CHECK(esp_lcd_new_panel_spd2010(io_handle, &panel_cfg, &panel));
+    } else {
+        // ── CO5300 (1.75") ──
+        co5300_vendor_config_t vendor_cfg = {
+            .init_cmds      = co5300_init_cmds,
+            .init_cmds_size = sizeof(co5300_init_cmds) / sizeof(co5300_init_cmds[0]),
+            .flags = { .use_qspi_interface = 1 },
+        };
+        esp_lcd_panel_dev_config_t panel_cfg = {
+            .reset_gpio_num = -1,
+            .data_endian    = LCD_RGB_DATA_ENDIAN_BIG,
+            .bits_per_pixel = 16,
+            .vendor_config  = &vendor_cfg,
+        };
+        ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(io_handle, &panel_cfg, &panel));
+    }
+
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+    if (board->x_gap || board->y_gap)
+        esp_lcd_panel_set_gap(panel, board->x_gap, board->y_gap);
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
-    // Backlight on
-    gpio_set_level(PIN_LCD_BL, 1);
-    ESP_LOGI(TAG, "Display ready (SPD2010 QSPI 412x412)");
+    if (board->has_backlight_gpio)
+        gpio_set_level(board->pin_lcd_bl, 1);
+
+    ESP_LOGI(TAG, "Display ready (%s)", board->name);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Touch — direct I2C to SPD2010 integrated touch controller (addr 0x53)
+// Touch — SPD2010 integrated (1.46") or CST9217 (1.75")
 // ─────────────────────────────────────────────────────────────────────────────
 
 static uint8_t ble_display_mode = 0;
@@ -427,13 +448,14 @@ static void IRAM_ATTR tp_isr(void *arg)
 
 static esp_err_t tp_i2c_write(const uint8_t *data, size_t len)
 {
+    uint8_t addr = board->tp_addr;
     i2c_txn_tp++;
 #ifdef USE_NEW_I2C_API
-    return i2c_master_transmit(i2c_get_dev(TP_ADDR), data, len, 50);
+    return i2c_master_transmit(i2c_get_dev(addr), data, len, 50);
 #else
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     i2c_master_start(h);
-    i2c_master_write_byte(h, (TP_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(h, (addr << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write(h, data, len, true);
     i2c_master_stop(h);
     esp_err_t e = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(50));
@@ -444,16 +466,17 @@ static esp_err_t tp_i2c_write(const uint8_t *data, size_t len)
 
 static esp_err_t tp_i2c_write_read(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out_len)
 {
+    uint8_t addr = board->tp_addr;
     i2c_txn_tp++;
 #ifdef USE_NEW_I2C_API
-    return i2c_master_transmit_receive(i2c_get_dev(TP_ADDR), cmd, cmd_len, out, out_len, 100);
+    return i2c_master_transmit_receive(i2c_get_dev(addr), cmd, cmd_len, out, out_len, 100);
 #else
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     i2c_master_start(h);
-    i2c_master_write_byte(h, (TP_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(h, (addr << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write(h, cmd, cmd_len, true);
     i2c_master_start(h);
-    i2c_master_write_byte(h, (TP_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_write_byte(h, (addr << 1) | I2C_MASTER_READ, true);
     i2c_master_read(h, out, out_len, I2C_MASTER_LAST_NACK);
     i2c_master_stop(h);
     esp_err_t e = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(50));
@@ -462,10 +485,9 @@ static esp_err_t tp_i2c_write_read(const uint8_t *cmd, size_t cmd_len, uint8_t *
 #endif
 }
 
-static void touch_init(void)
+// ── SPD2010 touch init (1.46") ──
+static void touch_init_spd2010(void)
 {
-
-    // Read status to see if touch CPU needs starting
     uint8_t cmd[2] = {0x20, 0x00};
     uint8_t status[4] = {0};
     tp_i2c_write_read(cmd, 2, status, 4);
@@ -474,7 +496,6 @@ static void touch_init(void)
     bool in_cpu  = (status[1] >> 5) & 1;
 
     if (in_bios) {
-        // Clear INT + start CPU
         uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
         tp_i2c_write(clr, 4); esp_rom_delay_us(200);
         uint8_t cpu[] = {0x04, 0x00, 0x01, 0x00};
@@ -482,7 +503,6 @@ static void touch_init(void)
         ESP_LOGI(TAG, "Touch: started CPU from BIOS");
         vTaskDelay(pdMS_TO_TICKS(100));
     } else if (in_cpu) {
-        // Set point mode + start + clear INT
         uint8_t pm[] = {0x50, 0x00, 0x00, 0x00};
         tp_i2c_write(pm, 4); esp_rom_delay_us(200);
         uint8_t st[] = {0x46, 0x00, 0x00, 0x00};
@@ -491,31 +511,51 @@ static void touch_init(void)
         tp_i2c_write(clr, 4); esp_rom_delay_us(200);
         ESP_LOGI(TAG, "Touch: configured point mode");
     }
+}
+
+// ── CST9217 touch init (1.75") ──
+static void touch_init_cst9217(void)
+{
+    // Hardware reset via direct GPIO
+    gpio_config_t rst_cfg = {
+        .pin_bit_mask = (1ULL << board->pin_tp_rst),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&rst_cfg);
+    gpio_set_level(board->pin_tp_rst, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(board->pin_tp_rst, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Touch: CST9217 reset complete");
+}
+
+static void touch_init(void)
+{
+    if (board->use_spd2010)
+        touch_init_spd2010();
+    else
+        touch_init_cst9217();
 
     // Set up interrupt on TP_INT (active low)
     tp_sem = xSemaphoreCreateBinary();
     gpio_config_t tp_cfg = {
-        .pin_bit_mask = (1ULL << PIN_TP_INT),
+        .pin_bit_mask = (1ULL << board->pin_tp_int),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .intr_type = GPIO_INTR_NEGEDGE,
     };
     gpio_config(&tp_cfg);
-    gpio_isr_handler_add(PIN_TP_INT, tp_isr, NULL);
+    gpio_isr_handler_add(board->pin_tp_int, tp_isr, NULL);
 
-    ESP_LOGI(TAG, "Touch ready (tap to toggle mode, INT on GPIO%d)", PIN_TP_INT);
+    ESP_LOGI(TAG, "Touch ready (tap to toggle mode, INT on GPIO%d)", board->pin_tp_int);
 }
 
 static uint32_t tp_serviced_count = 0;
 static uint32_t tp_spurious_count = 0;
 
-/** Check touch — only reads I2C when TP_INT fires. */
-static bool touch_check(void)
+// ── SPD2010 touch check ──
+static bool touch_check_spd2010(void)
 {
-    // Only proceed if the touch controller signalled an interrupt
-    if (xSemaphoreTake(tp_sem, 0) != pdTRUE) return false;
-
-    // Read status + length
     uint8_t cmd[2] = {0x20, 0x00};
     uint8_t status[4] = {0};
     if (tp_i2c_write_read(cmd, 2, status, 4) != ESP_OK) return false;
@@ -525,29 +565,56 @@ static bool touch_check(void)
 
     if (pt_exist && read_len > 0) {
         tp_serviced_count++;
-        // Read touch data to clear the controller's interrupt
         uint8_t hdr[2] = {0x00, 0x03};
         uint8_t data[64] = {0};
         int rlen = read_len > sizeof(data) ? sizeof(data) : read_len;
         tp_i2c_write_read(hdr, 2, data, rlen);
 
-        // Clear INT flag
         uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
         tp_i2c_write(clr, 4);
-
-        // Debounce
-        int64_t now = esp_timer_get_time();
-        if (now - last_touch_us > 1500000) {  // 1.5s debounce (blob init takes ~1s)
-            last_touch_us = now;
-            return true;
-        }
+        return true;
     } else {
         tp_spurious_count++;
-        // INT fired but no point data — just clear the flag
         uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
         tp_i2c_write(clr, 4);
     }
+    return false;
+}
 
+// ── CST9217 touch check — minimal: any touch event = tap ──
+static bool touch_check_cst9217(void)
+{
+    // Read touch count from register 0x02 (standard HYN protocol)
+    uint8_t reg = 0x02;
+    uint8_t count = 0;
+    if (i2c_read_reg(board->tp_addr, reg, &count, 1) != ESP_OK) return false;
+    count &= 0x0F;
+    if (count > 0) {
+        tp_serviced_count++;
+        return true;
+    }
+    tp_spurious_count++;
+    return false;
+}
+
+/** Check touch — only reads I2C when TP_INT fires. */
+static bool touch_check(void)
+{
+    if (xSemaphoreTake(tp_sem, 0) != pdTRUE) return false;
+
+    bool touched;
+    if (board->use_spd2010)
+        touched = touch_check_spd2010();
+    else
+        touched = touch_check_cst9217();
+
+    if (touched) {
+        int64_t now = esp_timer_get_time();
+        if (now - last_touch_us > 1500000) {
+            last_touch_us = now;
+            return true;
+        }
+    }
     return false;
 }
 
@@ -565,27 +632,37 @@ static void IRAM_ATTR te_isr(void *arg)
 
 static void te_init(void)
 {
+    if (board->pin_lcd_te < 0) {
+        ESP_LOGI(TAG, "TE sync not available on this board");
+        te_sem = xSemaphoreCreateBinary();
+        gpio_install_isr_service(0);
+        return;
+    }
     te_sem = xSemaphoreCreateBinary();
     gpio_config_t te_cfg = {
-        .pin_bit_mask = (1ULL << PIN_LCD_TE),
+        .pin_bit_mask = (1ULL << board->pin_lcd_te),
         .mode = GPIO_MODE_INPUT,
         .intr_type = GPIO_INTR_POSEDGE,
     };
     gpio_config(&te_cfg);
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(PIN_LCD_TE, te_isr, NULL);
+    gpio_isr_handler_add(board->pin_lcd_te, te_isr, NULL);
 }
 
-/** Push front buffer to the display and block until DMA is fully complete. */
-static uint16_t *fb[2];  // half-height aliases into front buffer, set at flush time
+/** Push front buffer to display in 4 strips.
+ *  Each strip must fit in the SPI DMA internal bounce buffer. */
+#define FLUSH_STRIPS 4
 
-/** Push front buffer to display. Blocking — returns after DMA is complete. */
 static void lcd_flush(void)
 {
-    fb[0] = framebuf[front_idx];
-    fb[1] = framebuf[front_idx] + LCD_W * HALF_H;
-    esp_lcd_panel_draw_bitmap(panel, 0, 0,        LCD_W, HALF_H, fb[0]);
-    esp_lcd_panel_draw_bitmap(panel, 0, HALF_H,   LCD_W, LCD_H,  fb[1]);
+    const int W = board->lcd_w, H = board->lcd_h;
+    uint16_t *base = framebuf[front_idx];
+    int strip_h = H / FLUSH_STRIPS;
+    for (int s = 0; s < FLUSH_STRIPS; s++) {
+        int y0 = s * strip_h;
+        int y1 = (s == FLUSH_STRIPS - 1) ? H : y0 + strip_h;
+        esp_lcd_panel_draw_bitmap(panel, 0, y0, W, y1, base + y0 * W);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -661,8 +738,15 @@ static void imu_accel(float *ax, float *ay, float *az)
 static i2s_chan_handle_t mic_handle;
 static float mic_loudness = 0;   // smoothed loudness (0..1)
 
+static bool mic_available = false;
+
 static void mic_init(void)
 {
+    if (board->pin_mic_sd < 0) {
+        ESP_LOGI(TAG, "No PDM mic on this board — mic_loudness stays 0");
+        return;
+    }
+
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &mic_handle));
 
@@ -671,21 +755,23 @@ static void mic_init(void)
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = PIN_MIC_SCK,
-            .ws   = PIN_MIC_WS,
-            .din  = PIN_MIC_SD,
+            .bclk = board->pin_mic_sck,
+            .ws   = board->pin_mic_ws,
+            .din  = board->pin_mic_sd,
             .dout = I2S_GPIO_UNUSED,
             .invert_flags = { false, false, false },
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(mic_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(mic_handle));
+    mic_available = true;
     ESP_LOGI(TAG, "Microphone ready (I2S %d Hz)", MIC_SAMPLE_RATE);
 }
 
 /** Read a block of mic samples and return RMS loudness (0..1). */
 static float mic_read_loudness(void)
 {
+    if (!mic_available) return 0;
     int32_t buf[MIC_BUF_SAMPLES];
     size_t bytes_read = 0;
     esp_err_t err = i2s_channel_read(mic_handle, buf, sizeof(buf), &bytes_read, 0);
@@ -858,20 +944,16 @@ static void draw_cat_pupil(int cx, int cy, int h, int w, uint16_t col)
 }
 
 // Precomputed sclera x-spans per row (sclera never moves)
-static int16_t sclera_x0[LCD_H];  // first sclera pixel on row
-static int16_t sclera_x1[LCD_H];  // last sclera pixel on row (inclusive), -1 if none
+static int16_t sclera_x0[LCD_MAX_H];
+static int16_t sclera_x1[LCD_MAX_H];
 
 // Sphere shading LUT: pre-blended sclera colors indexed by dist_sq >> 5
-#define SCLERA_R       195
-#define SCLERA_R2      (SCLERA_R * SCLERA_R)
 #define SHADE_SHIFT    5
-#define SHADE_LUT_SIZE ((SCLERA_R2 >> SHADE_SHIFT) + 2)
-static uint16_t sclera_shade[SHADE_LUT_SIZE];
+static uint16_t sclera_shade[SHADE_LUT_SIZE_MAX];
 
-// Iris texture LUT: precomputed 221×221 centered at (110,110), covers full iris+rim
-#define IRIS_TEX_R    110
-#define IRIS_TEX_SIZE (2 * IRIS_TEX_R + 1)
-static uint16_t *iris_tex;  // IRIS_TEX_SIZE * IRIS_TEX_SIZE entries in PSRAM
+// Iris texture LUT: dynamically allocated, sized from board->iris_tex_r
+static uint16_t *iris_tex;
+static int iris_tex_size;  // 2 * board->iris_tex_r + 1
 
 static void cat_eye_free(void)
 {
@@ -881,71 +963,58 @@ static void cat_eye_free(void)
 
 static void iris_tex_init(void)
 {
-    if (iris_tex) return;  // already initialized
-    const int sz = IRIS_TEX_SIZE * IRIS_TEX_SIZE;
+    if (iris_tex) return;
+    const int R = board->iris_tex_r;
+    iris_tex_size = 2 * R + 1;
+    const int sz = iris_tex_size * iris_tex_size;
     iris_tex = heap_caps_malloc(sz * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     if (!iris_tex) {
         ESP_LOGE(TAG, "Iris texture alloc failed");
         return;
     }
 
-    // Simple hash for repeatable pseudo-random fiber pattern
-    // Returns 0..255
     #define FIBER_HASH(a) ((uint8_t)(((a) * 2654435761u) >> 24))
 
-    const int rim_r = 110, iris_r = 102, inner_r = 50;
+    const int rim_r = board->rim_r, iris_r = board->iris_r;
     const int rim_r2 = rim_r * rim_r;
     const int iris_r2 = iris_r * iris_r;
-
-    // Number of radial fiber "sectors"
     const int n_fibers = 48;
 
-    for (int dy = -IRIS_TEX_R; dy <= IRIS_TEX_R; dy++) {
-        for (int dx = -IRIS_TEX_R; dx <= IRIS_TEX_R; dx++) {
-            int idx = (dy + IRIS_TEX_R) * IRIS_TEX_SIZE + (dx + IRIS_TEX_R);
+    for (int dy = -R; dy <= R; dy++) {
+        for (int dx = -R; dx <= R; dx++) {
+            int idx = (dy + R) * iris_tex_size + (dx + R);
             int d2 = dx * dx + dy * dy;
 
             if (d2 > rim_r2) {
-                iris_tex[idx] = 0;  // transparent (won't be drawn)
+                iris_tex[idx] = 0;
                 continue;
             }
             if (d2 > iris_r2) {
-                // Limbal ring — dark rim
                 iris_tex[idx] = COL_IRIS_RIM;
                 continue;
             }
 
             float dist = sqrtf((float)d2);
             float angle = atan2f((float)dy, (float)dx);
-
-            // Radial position: 0 at centre, 1 at iris edge
             float t = dist / (float)iris_r;
 
-            // Fiber pattern: angle quantized into sectors, with per-sector brightness
             int sector = (int)((angle / (2.0f * M_PI) + 0.5f) * n_fibers) % n_fibers;
-            float fiber_bright = (FIBER_HASH(sector) / 255.0f) * 0.3f - 0.15f;  // ±0.15
+            float fiber_bright = (FIBER_HASH(sector) / 255.0f) * 0.3f - 0.15f;
 
-            // Secondary finer fibers
             int sector2 = (int)((angle / (2.0f * M_PI) + 0.5f) * (n_fibers * 3)) % (n_fibers * 3);
             float fiber2 = (FIBER_HASH(sector2 + 97) / 255.0f) * 0.15f - 0.075f;
 
-            // Radial gradient: lighter near pupil, richer mid-iris, darker near rim
             float radial;
-            if (t < 0.3f) {
-                // Inner glow near pupil — slightly golden/lighter
+            if (t < 0.3f)
                 radial = 0.15f * (1.0f - t / 0.3f);
-            } else {
-                // Darken towards rim
+            else
                 radial = -0.25f * ((t - 0.3f) / 0.7f);
-            }
 
             float brightness = 1.0f + fiber_bright + fiber2 + radial;
             if (brightness < 0.5f) brightness = 0.5f;
             if (brightness > 1.3f) brightness = 1.3f;
 
-            // Base iris colour with variation
             float r_base = 25.0f, g_base = 82.0f, b_base = 190.0f;
-            // Add slight warm shift near pupil
             float warm = (t < 0.4f) ? 0.3f * (1.0f - t / 0.4f) : 0.0f;
 
             uint8_t cr = (uint8_t)fminf(255, fmaxf(0, (r_base + warm * 40.0f) * brightness));
@@ -962,83 +1031,84 @@ static void iris_tex_init(void)
 
 static void sclera_lut_init(void)
 {
-    const int r = SCLERA_R;
-    const int r2 = SCLERA_R2;
+    const int r = board->sclera_r;
+    const int r2 = r * r;
+    const int H = board->lcd_h, W = board->lcd_w;
+    const int CX = board->eye_cx, CY = board->eye_cy;
+    int shade_lut_size = (r2 >> SHADE_SHIFT) + 2;
 
-    // Build shade LUT — sphere-like falloff: bright centre, dark edges
-    for (int i = 0; i < SHADE_LUT_SIZE; i++) {
+    for (int i = 0; i < shade_lut_size; i++) {
         float d2 = (float)(i << SHADE_SHIFT);
-        float t = d2 / (float)r2;           // 0 at centre, 1 at edge
+        float t = d2 / (float)r2;
         if (t > 1.0f) t = 1.0f;
-        float shade = sqrtf(1.0f - t);      // lambertian sphere falloff
-        // Blend from sclera colour down to a shadow tone
+        float shade = sqrtf(1.0f - t);
         uint8_t sr = (uint8_t)(240.0f * shade + 60.0f * (1.0f - shade));
         uint8_t sg = (uint8_t)(240.0f * shade + 55.0f * (1.0f - shade));
         uint8_t sb = (uint8_t)(246.0f * shade + 70.0f * (1.0f - shade));
         sclera_shade[i] = rgb(sr, sg, sb);
     }
 
-    // Build row spans
-    for (int y = 0; y < LCD_H; y++) {
-        int dy = y - EYE_CY;
+    for (int y = 0; y < H; y++) {
+        int dy = y - CY;
         int dy2 = dy * dy;
         if (dy2 > r2) {
             sclera_x0[y] = 0;
             sclera_x1[y] = -1;
         } else {
             int dx = (int)sqrtf((float)(r2 - dy2));
-            sclera_x0[y] = EYE_CX - dx;
-            sclera_x1[y] = EYE_CX + dx;
+            sclera_x0[y] = CX - dx;
+            sclera_x1[y] = CX + dx;
             if (sclera_x0[y] < 0) sclera_x0[y] = 0;
-            if (sclera_x1[y] >= LCD_W) sclera_x1[y] = LCD_W - 1;
+            if (sclera_x1[y] >= W) sclera_x1[y] = W - 1;
         }
     }
 }
 
 static void eye_draw_cat(void)
 {
-    int ix = EYE_CX + (int)eye.px + (int)eye.rpx;
-    int iy = EYE_CY + (int)eye.py + (int)eye.rpy;
+    const int W = board->lcd_w, H = board->lcd_h;
+    const int CX = board->eye_cx, CY = board->eye_cy;
+    const int SR = board->sclera_r;
+    const int ITR = board->iris_tex_r;
+
+    int ix = CX + (int)eye.px + (int)eye.rpx;
+    int iy = CY + (int)eye.py + (int)eye.rpy;
 
     int pupil_w = 16 + (int)(mic_loudness * 70);
 
-    for (int y = 0; y < LCD_H; y++) {
-        uint16_t *row = draw_fb + y * LCD_W;
+    for (int y = 0; y < H; y++) {
+        uint16_t *row = draw_fb + y * W;
         int sx0 = sclera_x0[y];
         int sx1 = sclera_x1[y];
 
-        // Black outside sclera
         for (int x = 0; x < sx0; x++) row[x] = COL_BLACK;
-        for (int x = sx1 + 1; x < LCD_W; x++) row[x] = COL_BLACK;
+        for (int x = sx1 + 1; x < W; x++) row[x] = COL_BLACK;
 
-        if (sx1 < 0) continue;  // entire row is black
+        if (sx1 < 0) continue;
 
-        // Shaded sclera fill (sphere falloff)
-        int dy_s2 = (y - EYE_CY) * (y - EYE_CY);
+        int dy_s2 = (y - CY) * (y - CY);
         for (int x = sx0; x <= sx1; x++) {
-            int dx_s = x - EYE_CX;
+            int dx_s = x - CX;
             int d2 = dx_s * dx_s + dy_s2;
             row[x] = sclera_shade[d2 >> SHADE_SHIFT];
         }
 
-        // Iris (textured) — single pass using precomputed LUT
         int dy_i = y - iy;
         int dy_i2 = dy_i * dy_i;
-        int rim_r2 = IRIS_TEX_R * IRIS_TEX_R;
+        int rim_r2 = ITR * ITR;
 
         if (dy_i2 <= rim_r2) {
             int rim_dx = (int)sqrtf((float)(rim_r2 - dy_i2));
             int x0 = ix - rim_dx; if (x0 < sx0) x0 = sx0;
             int x1 = ix + rim_dx; if (x1 > sx1) x1 = sx1;
-            int tex_row = (dy_i + IRIS_TEX_R) * IRIS_TEX_SIZE;
+            int tex_row = (dy_i + ITR) * iris_tex_size;
             for (int x = x0; x <= x1; x++) {
                 int dx_i = x - ix;
-                row[x] = iris_tex[tex_row + dx_i + IRIS_TEX_R];
+                row[x] = iris_tex[tex_row + dx_i + ITR];
             }
         }
 
-        // Horizontal cat pupil slit (ellipse: semi-major=90 horizontal, semi-minor=pupil_w)
-        int pupil_hw = 90;
+        int pupil_hw = board->pupil_hw;
         if (pupil_w > 0 && dy_i >= -pupil_w && dy_i <= pupil_w) {
             float t = (float)dy_i / (float)pupil_w;
             int span = (int)(pupil_hw * sqrtf(1.0f - t * t));
@@ -1049,18 +1119,17 @@ static void eye_draw_cat(void)
         }
     }
 
-    // Eyelids — close from left and right (screen mounted sideways)
     if (blink_pos > 0.01f) {
-        int lid_travel = (int)(SCLERA_R * blink_pos);
-        int left_edge  = EYE_CX - SCLERA_R + lid_travel;   // left lid's right edge
-        int right_edge = EYE_CX + SCLERA_R - lid_travel;   // right lid's left edge
+        int lid_travel = (int)(SR * blink_pos);
+        int left_edge  = CX - SR + lid_travel;
+        int right_edge = CX + SR - lid_travel;
 
-        for (int y = 0; y < LCD_H; y++) {
+        for (int y = 0; y < H; y++) {
             int sx0 = sclera_x0[y];
             int sx1 = sclera_x1[y];
             if (sx1 < 0) continue;
 
-            uint16_t *row = draw_fb + y * LCD_W;
+            uint16_t *row = draw_fb + y * W;
             for (int x = sx0; x <= sx1; x++) {
                 if (x <= left_edge || x >= right_edge) {
                     uint16_t col = COL_SKIN;
@@ -1094,21 +1163,26 @@ static uint8_t *spiral_mask      = NULL;  // 1 = inside circle, 0 = outside
 
 static void spiral_lut_init(void)
 {
-    if (spiral_angle_lut) return;  // already initialized
-    spiral_angle_lut = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
-    spiral_dist_lut  = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
-    spiral_mask      = heap_caps_malloc(LCD_PIXELS, MALLOC_CAP_SPIRAM);
+    if (spiral_angle_lut) return;
+    const int W = board->lcd_w, H = board->lcd_h;
+    const int CX = board->eye_cx, CY = board->eye_cy;
+    const float SR = (float)board->sclera_r;
+
+    spiral_angle_lut = heap_caps_malloc(lcd_pixels, MALLOC_CAP_SPIRAM);
+    spiral_dist_lut  = heap_caps_malloc(lcd_pixels, MALLOC_CAP_SPIRAM);
+    spiral_mask      = heap_caps_malloc(lcd_pixels, MALLOC_CAP_SPIRAM);
     if (!spiral_angle_lut || !spiral_dist_lut || !spiral_mask) {
         ESP_LOGE(TAG, "Spiral LUT alloc failed");
         return;
     }
-    for (int y = 0; y < LCD_H; y++) {
-        for (int x = 0; x < LCD_W; x++) {
-            int i = y * LCD_W + x;
-            float dx = x - EYE_CX;
-            float dy = y - EYE_CY;
+    float sr2 = SR * SR;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int i = y * W + x;
+            float dx = x - CX;
+            float dy = y - CY;
             float dist_sq = dx * dx + dy * dy;
-            if (dist_sq > 195.0f * 195.0f) {
+            if (dist_sq > sr2) {
                 spiral_mask[i] = 0;
                 spiral_angle_lut[i] = 0;
                 spiral_dist_lut[i] = 0;
@@ -1117,11 +1191,8 @@ static void spiral_lut_init(void)
             spiral_mask[i] = 1;
             float dist = sqrtf(dist_sq);
             float angle = atan2f(dy, dx);
-            // Store angle as fixed-point 0–255
             spiral_angle_lut[i] = (uint8_t)((int)(angle / (2.0f * M_PI) * 256.0f) & 0xFF);
-            // Store log(dist) as fixed-point for log-spiral (bands widen toward edge)
             float log_d = (dist > 1.0f) ? logf(dist) : 0;
-            // log(195) ≈ 5.27, scale to use full 0–255 range
             spiral_dist_lut[i] = (uint8_t)((int)(log_d * 48.0f) & 0xFF);
         }
     }
@@ -1154,7 +1225,7 @@ static void eye_draw_hypnotoad(void)
     uint16_t zoom_mult = (uint16_t)(spiral_zoom * 256.0f * 256.0f / (48.0f * 2.0f * 3.14159f));
 
     uint16_t black = COL_BLACK;
-    for (int i = 0; i < LCD_PIXELS; i++) {
+    for (int i = 0; i < lcd_pixels; i++) {
         if (!spiral_mask[i]) {
             draw_fb[i] = black;
         } else {
@@ -1166,7 +1237,7 @@ static void eye_draw_hypnotoad(void)
         }
     }
 
-    draw_circle(EYE_CX, EYE_CY, 20, COL_PUPIL);
+    draw_circle(board->eye_cx, board->eye_cy, 20, COL_PUPIL);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1344,6 +1415,10 @@ static void eye_draw_anim(void)
 {
     if (!anim_all_frames) return;
 
+    const int W = board->lcd_w, H = board->lcd_h;
+    const int CX = board->eye_cx, CY = board->eye_cy;
+    const int SR = board->sclera_r;
+
     const uint8_t *frame = anim_all_frames +
         anim_frame_idx * anim_frame_w * anim_frame_h;
     uint16_t bg = anim_palette_rgb565[0];
@@ -1351,22 +1426,22 @@ static void eye_draw_anim(void)
 
     int scaled_w = anim_frame_w * 2;
     int scaled_h = anim_frame_h * 2;
-    int ox = (LCD_W - scaled_w) / 2;
-    int oy = (LCD_H - scaled_h) / 2;
-    int eye_r2 = 195 * 195;
+    int ox = (W - scaled_w) / 2;
+    int oy = (H - scaled_h) / 2;
+    int eye_r2 = SR * SR;
 
-    for (int y = 0; y < LCD_H; y++) {
-        int row = y * LCD_W;
-        int dy = y - EYE_CY;
+    for (int y = 0; y < H; y++) {
+        int row = y * W;
+        int dy = y - CY;
         int dy2 = dy * dy;
         int sy = y - oy;
         int fy = sy >> 1;
         int in_frame_y = (sy >= 0 && sy < scaled_h && fy < anim_frame_h);
         const uint8_t *frame_row = in_frame_y ? frame + fy * anim_frame_w : NULL;
 
-        for (int x = 0; x < LCD_W; x++) {
+        for (int x = 0; x < W; x++) {
             int i = row + x;
-            int dxx = x - EYE_CX;
+            int dxx = x - CX;
             if (dxx * dxx + dy2 > eye_r2) {
                 draw_fb[i] = black;
             } else if (frame_row) {
@@ -1382,12 +1457,9 @@ static void eye_draw_anim(void)
         }
     }
 
-    // Advance frame
     if (anim_playback == 1) {
-        // Loop
         anim_frame_idx = (anim_frame_idx + 1) % anim_num_frames;
     } else {
-        // Ping-pong
         anim_frame_idx += anim_frame_dir;
         if (anim_frame_idx >= anim_num_frames - 1)
             anim_frame_dir = -1;
@@ -1407,41 +1479,36 @@ static float sauron_blink_hold = 0;
 
 static void eye_draw_sauron(void)
 {
-    // Draw the fire animation
+    const int W = board->lcd_w, H = board->lcd_h;
+    const int CX = board->eye_cx, CY = board->eye_cy;
+
     eye_draw_anim();
 
-    // Overlay vertical slit pupil
-    // Width: base narrow slit + widens with noise
-    int base_w = 14 + (int)(mic_loudness * 24);  // 14–38 px half-width
-    int slit_half_h = 70;                         // constant height
+    int base_w = board->sauron_base_w + (int)(mic_loudness * 24);
+    int slit_half_h = board->slit_half_h;
 
-    // Periodic blink: narrows to a thin line (width → 1px)
     float open = 1.0f - render_params.sauron_blink_pos;
     int min_w = (int)(base_w * 0.2f);
     if (min_w < 1) min_w = 1;
     int slit_half_w = min_w + (int)((base_w - min_w) * open);
 
-    // Draw the slit as a filled black ellipse
-    int cx = EYE_CX, cy = EYE_CY;
-    // Precompute inverse radii squared (avoid per-pixel division)
+    int cx = CX, cy = CY;
     if (slit_half_w < 1) slit_half_w = 1;
     if (slit_half_h < 1) slit_half_h = 1;
     int sw2 = slit_half_w * slit_half_w;
     int sh2 = slit_half_h * slit_half_h;
 
     int y0 = cy - slit_half_h - 2; if (y0 < 0) y0 = 0;
-    int y1 = cy + slit_half_h + 2; if (y1 >= LCD_H) y1 = LCD_H - 1;
+    int y1 = cy + slit_half_h + 2; if (y1 >= H) y1 = H - 1;
     int x0 = cx - slit_half_w - 2; if (x0 < 0) x0 = 0;
-    int x1 = cx + slit_half_w + 2; if (x1 >= LCD_W) x1 = LCD_W - 1;
+    int x1 = cx + slit_half_w + 2; if (x1 >= W) x1 = W - 1;
 
     for (int y = y0; y <= y1; y++) {
         int dy = y - cy;
-        int dy2_sh2 = dy * dy * sw2;  // dy² * sw² for cross-multiply comparison
-        int row = y * LCD_W;
+        int dy2_sh2 = dy * dy * sw2;
+        int row = y * W;
         for (int x = x0; x <= x1; x++) {
             int dxx = x - cx;
-            // Ellipse test: (dx/sw)² + (dy/sh)² <= 1
-            // Cross-multiply: dx²*sh² + dy²*sw² <= sw²*sh²
             if (dxx * dxx * sh2 + dy2_sh2 <= sw2 * sh2) {
                 draw_fb[row + x] = COL_BLACK;
             }
@@ -1490,7 +1557,7 @@ static void eye_draw(void)
 {
     if (display_mode != active_mode) {
         // Clear screen — this frame gets flushed as black while resources load
-        for (int i = 0; i < LCD_PIXELS; i++)
+        for (int i = 0; i < lcd_pixels; i++)
             draw_fb[i] = COL_BLACK;
         eye_mode_switch(display_mode);
         return;  // show black frame; next call draws the new mode
@@ -1548,35 +1615,41 @@ static void render_task(void *arg)
 // ─────────────────────────────────────────────────────────────────────────────
 static void power_latch_init(void)
 {
-    // Drive BAT_Control LOW to keep P-MOSFET Q1 conducting (battery → VCC)
+    if (board->pin_bat_control < 0) {
+        ESP_LOGI(TAG, "No power latch on this board (PMIC manages power)");
+        return;
+    }
+
     gpio_config_t pwr_cfg = {
-        .pin_bit_mask = (1ULL << PIN_BAT_CONTROL),
+        .pin_bit_mask = (1ULL << board->pin_bat_control),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&pwr_cfg);
-    gpio_set_level(PIN_BAT_CONTROL, 1);
+    gpio_set_level(board->pin_bat_control, 1);
 
-    // PWR button input (active low, internal pull-up)
-    gpio_config_t key_cfg = {
-        .pin_bit_mask = (1ULL << PIN_KEY_BAT),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&key_cfg);
+    if (board->pin_key_bat >= 0) {
+        gpio_config_t key_cfg = {
+            .pin_bit_mask = (1ULL << board->pin_key_bat),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&key_cfg);
+    }
 
-    ESP_LOGI(TAG, "Power latch engaged (GPIO%d LOW)", PIN_BAT_CONTROL);
+    ESP_LOGI(TAG, "Power latch engaged (GPIO%d)", board->pin_bat_control);
 }
 
 static void power_off(void)
 {
+    if (board->pin_bat_control < 0) return;
     ESP_LOGW(TAG, "Powering off!");
-    gpio_set_level(PIN_BAT_CONTROL, 0);  // Release latch → power cut
-    vTaskDelay(pdMS_TO_TICKS(1000));      // Wait for power to drop
+    gpio_set_level(board->pin_bat_control, 0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
 // Battery ADC — GPIO8 has a ÷3 voltage divider, so battery_V = adc_V * 3
@@ -1586,6 +1659,11 @@ static float battery_percent = 0;
 
 static void battery_adc_init(void)
 {
+    if (board->pin_bat_adc < 0) {
+        ESP_LOGI(TAG, "No battery ADC on this board (PMIC manages battery)");
+        return;
+    }
+
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = ADC_UNIT_1,
     };
@@ -1603,6 +1681,7 @@ static float bat_adc_raw = 0;
 
 static float battery_read_voltage(void)
 {
+    if (board->pin_bat_adc < 0) return 0;
     int raw_int = 0;
     adc_oneshot_read(bat_adc_handle, ADC_CHANNEL_7, &raw_int);
     bat_adc_raw = (float)raw_int;
@@ -1624,13 +1703,17 @@ static float battery_read_voltage(void)
 
 void app_main(void)
 {
+    // Detect which board we're on BEFORE any hardware init
+    board = detect_board();
+    lcd_pixels = board->lcd_w * board->lcd_h;
+    ESP_LOGI(TAG, "Eyeball starting up — Board: %s", board->name);
+
     power_latch_init();
     battery_adc_init();
-    ESP_LOGI(TAG, "Eyeball starting up (1.46\" SPD2010)");
 
-    // Double framebuffers in PSRAM (~660 KB total)
-    framebuf[0] = heap_caps_malloc(LCD_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-    framebuf[1] = heap_caps_malloc(LCD_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    // Double framebuffers in PSRAM
+    framebuf[0] = heap_caps_malloc(lcd_pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    framebuf[1] = heap_caps_malloc(lcd_pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     draw_fb = framebuf[0];
 
     if (!framebuf[0] || !framebuf[1]) {
@@ -1638,7 +1721,7 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "Double framebuffers: %.1f KB in PSRAM",
-             LCD_PIXELS * 2.0f * 2.0f / 1024.0f);
+             lcd_pixels * 2.0f * 2.0f / 1024.0f);
 
     // Create dual-core sync semaphores
     render_done_sem = xSemaphoreCreateBinary();
@@ -1848,20 +1931,25 @@ void app_main(void)
             perf_sensor_us = perf_flush_us = perf_wait_us = 0;
 
             battery_read_voltage();
-            ESP_LOGI(TAG, "PWR: BAT_CTRL(IO7)=%d KEY_BAT(IO6)=%d BAT=%.2fV (raw=%.0f adc=%.3fV)",
-                     gpio_get_level(PIN_BAT_CONTROL), gpio_get_level(PIN_KEY_BAT),
-                     battery_voltage, bat_adc_raw, bat_adc_raw * 3.1f / 4095.0f);
+            if (board->pin_bat_control >= 0) {
+                ESP_LOGI(TAG, "PWR: BAT_CTRL(IO%d)=%d KEY_BAT(IO%d)=%d BAT=%.2fV (raw=%.0f adc=%.3fV)",
+                         board->pin_bat_control, gpio_get_level(board->pin_bat_control),
+                         board->pin_key_bat, gpio_get_level(board->pin_key_bat),
+                         battery_voltage, bat_adc_raw, bat_adc_raw * 3.1f / 4095.0f);
+            }
 
             ble_notify_all();
         }
 
-        // PWR button long-press → power off
-        if (gpio_get_level(PIN_KEY_BAT) == 0) {
-            if (pwr_btn_down_since == 0) pwr_btn_down_since = now_us;
-            else if ((now_us - pwr_btn_down_since) > PWR_BUTTON_SHUTDOWN_MS * 1000LL)
-                power_off();
-        } else {
-            pwr_btn_down_since = 0;
+        // PWR button long-press → power off (only on boards with hardware button)
+        if (board->pin_key_bat >= 0) {
+            if (gpio_get_level(board->pin_key_bat) == 0) {
+                if (pwr_btn_down_since == 0) pwr_btn_down_since = now_us;
+                else if ((now_us - pwr_btn_down_since) > PWR_BUTTON_SHUTDOWN_MS * 1000LL)
+                    power_off();
+            } else {
+                pwr_btn_down_since = 0;
+            }
         }
     }
 }
