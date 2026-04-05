@@ -87,6 +87,7 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
             case 0: return Self.catEyeUUIDs.contains(uuid)
             case 1: return Self.hypnotoadUUIDs.contains(uuid)
             case 2: return Self.blobEyeUUIDs.contains(uuid)
+            case 3: return Self.blobEyeUUIDs.contains(uuid)  // Sauron shares blob params
             default: return true
             }
         }

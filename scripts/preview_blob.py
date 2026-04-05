@@ -79,9 +79,13 @@ def load_blob_frames(path):
 
 
 def main():
-    bin_path = Path(__file__).parent.parent / "main" / "blob_frames.bin"
+    if len(sys.argv) > 1:
+        bin_path = Path(sys.argv[1])
+    else:
+        bin_path = Path(__file__).parent.parent / "output" / "blob_frames.bin"
     if not bin_path.exists():
         print(f"Not found: {bin_path}")
+        print("Usage: preview_blob.py [path_to_frames.bin]")
         sys.exit(1)
 
     w, h, num_frames, pal, frames = load_blob_frames(bin_path)
@@ -98,6 +102,7 @@ def main():
 
     frame_idx = [0]
     direction = [1]
+    pingpong = [True]  # True=bounce, False=loop
     paused = [False]
     tk_img = [None]
 
@@ -109,11 +114,14 @@ def main():
         canvas.create_image(0, 0, anchor=tk.NW, image=tk_img[0])
 
         if not paused[0]:
-            frame_idx[0] += direction[0]
-            if frame_idx[0] >= num_frames - 1:
-                direction[0] = -1
-            elif frame_idx[0] <= 0:
-                direction[0] = 1
+            if pingpong[0]:
+                frame_idx[0] += direction[0]
+                if frame_idx[0] >= num_frames - 1:
+                    direction[0] = -1
+                elif frame_idx[0] <= 0:
+                    direction[0] = 1
+            else:
+                frame_idx[0] = (frame_idx[0] + 1) % num_frames
 
         root.after(33, update)
 
@@ -124,11 +132,18 @@ def main():
             frame_idx[0] = min(frame_idx[0] + 1, num_frames - 1)
         elif event.keysym == "Left":
             frame_idx[0] = max(frame_idx[0] - 1, 0)
+        elif event.keysym == "l":
+            pingpong[0] = not pingpong[0]
+            print(f"Playback: {'ping-pong' if pingpong[0] else 'loop'}")
         elif event.keysym in ("q", "Escape"):
             root.destroy()
 
     root.bind("<Key>", on_key)
-    print("Controls: Space=pause, Left/Right=step, Q=quit")
+    # Default to loop mode if filename contains "sauron"
+    if "sauron" in str(bin_path).lower():
+        pingpong[0] = False
+    print(f"Controls: Space=pause, Left/Right=step, L=toggle loop/pingpong, Q=quit")
+    print(f"Playback: {'ping-pong' if pingpong[0] else 'loop'}")
     update()
     root.mainloop()
 

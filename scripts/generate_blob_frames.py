@@ -194,7 +194,7 @@ def render_frame(frame_idx, total_frames):
 
 
 def main():
-    out_path = Path(__file__).parent.parent / "main" / "blob_frames.bin"
+    out_path = Path(__file__).parent.parent / "output" / "blob_frames.bin"
 
     print(f"Generating {NUM_FRAMES} frames at {W}×{H} (6-bit palette + RLE)...")
     pal64, pal256 = build_palette()
@@ -212,8 +212,8 @@ def main():
 
     # Header: 16 bytes
     # [width:u16][height:u16][num_frames:u16][palette_size:u16][bits_per_pixel:u8][reserved:7]
-    header = struct.pack("<HHHHb", W, H, NUM_FRAMES, PALETTE_SIZE, 6)
-    header += b"\x00" * 7
+    header = struct.pack("<HHHHbb", W, H, NUM_FRAMES, PALETTE_SIZE, 6, 0)  # playback=0 (ping-pong)
+    header += b"\x00" * 6
 
     # Frame offset table: uint32 per frame (offset from start of file)
     palette_bytes = PALETTE_SIZE * 3
