@@ -65,10 +65,19 @@ typedef struct {
     int pin_tp_rst;    // -1 if reset via TCA9554
     uint8_t tp_addr;
 
-    // Mic / audio
-    int pin_mic_ws;    // -1 if no PDM mic (Board B uses codec)
+    // Mic / audio (PDM mic on 1.46", ES8311 codec on 1.75")
+    int pin_mic_ws;    // -1 if no PDM mic
     int pin_mic_sck;
     int pin_mic_sd;
+
+    // ES8311 codec (1.75" only, -1 if not present)
+    int pin_codec_mclk;
+    int pin_codec_bclk;
+    int pin_codec_ws;
+    int pin_codec_din;   // codec → ESP32 (mic data)
+    int pin_codec_dout;  // ESP32 → codec (speaker data)
+    int pin_codec_pa;    // speaker PA enable
+    bool has_codec;
 
     // Power management
     int pin_bat_control;  // -1 if using PMIC
@@ -123,6 +132,14 @@ static const board_config_t board_config_146 = {
     .pin_mic_sck = 15,
     .pin_mic_sd  = 39,
 
+    .pin_codec_mclk = -1,
+    .pin_codec_bclk = -1,
+    .pin_codec_ws   = -1,
+    .pin_codec_din  = -1,
+    .pin_codec_dout = -1,
+    .pin_codec_pa   = -1,
+    .has_codec      = false,
+
     .pin_bat_control = 7,
     .pin_key_bat     = 6,
     .pin_bat_adc     = 8,
@@ -170,9 +187,17 @@ static const board_config_t board_config_175 = {
     .pin_tp_rst = 40,     // direct GPIO
     .tp_addr    = 0x5A,   // CST9217
 
-    .pin_mic_ws  = -1,    // no PDM mic — ES8311 codec (Phase 2)
+    .pin_mic_ws  = -1,    // no PDM mic
     .pin_mic_sck = -1,
     .pin_mic_sd  = -1,
+
+    .pin_codec_mclk = 42,
+    .pin_codec_bclk = 9,
+    .pin_codec_ws   = 45,
+    .pin_codec_din  = 10,   // ES7210 ASDOUT → ESP32 (mic data)
+    .pin_codec_dout = 8,    // ESP32 DSDIN → ES8311 (speaker data)
+    .pin_codec_pa   = 46,   // speaker PA enable
+    .has_codec      = true,
 
     .pin_bat_control = -1,  // AXP2101 PMIC
     .pin_key_bat     = -1,

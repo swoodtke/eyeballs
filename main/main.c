@@ -58,6 +58,8 @@ typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_BLOB_EYE, MODE_SAURON } displa
 #define NUM_MODES 4
 static display_mode_t display_mode = MODE_CAT_EYE;
 static float current_fps = 0;
+static uint8_t display_brightness = 100;  // 0-100%, only used on CO5300 (1.75" board)
+static uint8_t prev_brightness = 100;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Framebuffer  (double-buffered in PSRAM, sized at runtime from board config)
@@ -730,20 +732,189 @@ static void imu_accel(float *ax, float *ay, float *az)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Audio codecs (1.75" board):
+//   ES8311 (0x18) — DAC for speaker (provides I2S slave clocking)
+//   ES7210 (0x40) — ADC for microphone input
+// Both share the same I2S bus (MCLK/BCLK/WS), with separate data lines.
+// ─────────────────────────────────────────────────────────────────────────────
+#define ES8311_ADDR  0x18
+#define ES7210_ADDR  0x40
+
+static bool codec_available = false;
+
+/** Helper: read-modify-write a register with mask */
+static void i2c_update_reg(uint8_t addr, uint8_t reg, uint8_t mask, uint8_t val)
+{
+    uint8_t old = 0;
+    i2c_read_reg(addr, reg, &old, 1);
+    i2c_write_reg(addr, reg, (old & ~mask) | (val & mask));
+}
+
+static void es8311_init(void)
+{
+    // ES8311 is the DAC/speaker codec — we init it so I2S clocks work properly
+    i2c_write_reg(ES8311_ADDR, 0x00, 0x1F);   // Reset
+    vTaskDelay(pdMS_TO_TICKS(20));
+    i2c_write_reg(ES8311_ADDR, 0x00, 0x00);
+    i2c_write_reg(ES8311_ADDR, 0x00, 0x80);   // Power on
+
+    // Clock config: 16kHz, MCLK=4.096MHz from ESP32
+    i2c_write_reg(ES8311_ADDR, 0x01, 0x3F);   // All clocks on, MCLK from pin
+    i2c_write_reg(ES8311_ADDR, 0x02, 0x00);
+    i2c_write_reg(ES8311_ADDR, 0x03, 0x10);
+    i2c_write_reg(ES8311_ADDR, 0x04, 0x10);
+    i2c_write_reg(ES8311_ADDR, 0x05, 0x00);
+    i2c_write_reg(ES8311_ADDR, 0x06, 0x03);
+    i2c_write_reg(ES8311_ADDR, 0x07, 0x00);
+    i2c_write_reg(ES8311_ADDR, 0x08, 0xFF);
+
+    // Slave mode, 16-bit I2S
+    i2c_update_reg(ES8311_ADDR, 0x00, 0x40, 0x00);
+    i2c_write_reg(ES8311_ADDR, 0x09, 0x0C);   // SDP In: 16-bit
+    i2c_write_reg(ES8311_ADDR, 0x0A, 0x4C);   // SDP Out: 16-bit, ADC muted (bit 6) — ES7210 owns the data line
+
+    // Power up
+    i2c_write_reg(ES8311_ADDR, 0x0D, 0x01);
+    i2c_write_reg(ES8311_ADDR, 0x0E, 0x02);
+    i2c_write_reg(ES8311_ADDR, 0x12, 0x00);
+    i2c_write_reg(ES8311_ADDR, 0x13, 0x10);
+    i2c_write_reg(ES8311_ADDR, 0x1C, 0x6A);
+    i2c_write_reg(ES8311_ADDR, 0x37, 0x08);
+
+    ESP_LOGI(TAG, "ES8311 DAC initialized (I2S slave, 16kHz)");
+}
+
+static void es7210_init(void)
+{
+    // Verify ES7210 is present
+    uint8_t val = 0;
+    esp_err_t err = i2c_read_reg(ES7210_ADDR, 0x00, &val, 1);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ES7210 not found at 0x%02X", ES7210_ADDR);
+        return;
+    }
+    ESP_LOGI(TAG, "ES7210 found (reg00=0x%02X)", val);
+
+    // Reset
+    i2c_write_reg(ES7210_ADDR, 0x00, 0xFF);
+    i2c_write_reg(ES7210_ADDR, 0x00, 0x41);
+
+    // Clock enable
+    i2c_write_reg(ES7210_ADDR, 0x01, 0x3F);
+
+    // Timing control
+    i2c_write_reg(ES7210_ADDR, 0x09, 0x30);
+    i2c_write_reg(ES7210_ADDR, 0x0A, 0x30);
+
+    // HPF (high-pass filter to remove DC offset)
+    i2c_write_reg(ES7210_ADDR, 0x22, 0x0A);
+    i2c_write_reg(ES7210_ADDR, 0x23, 0x2A);
+    i2c_write_reg(ES7210_ADDR, 0x20, 0x0A);
+    i2c_write_reg(ES7210_ADDR, 0x21, 0x2A);
+
+    // Slave mode
+    i2c_update_reg(ES7210_ADDR, 0x08, 0x01, 0x00);
+
+    // Analog config
+    i2c_write_reg(ES7210_ADDR, 0x40, 0x43);   // Analog power
+    i2c_write_reg(ES7210_ADDR, 0x41, 0x70);   // MIC12 bias
+    i2c_write_reg(ES7210_ADDR, 0x42, 0x70);   // MIC34 bias
+
+    // Sample rate: 16kHz with MCLK=4.096MHz
+    // coeff: {4096000, 16000, adc_div=0x00, doubler=1, dll=1, osr=0x20, lrck_h=1, lrck_l=0}
+    i2c_write_reg(ES7210_ADDR, 0x02, 0xC0);   // adc_div=0 | doubler<<6 | dll<<7
+    i2c_write_reg(ES7210_ADDR, 0x07, 0x20);   // OSR
+    i2c_write_reg(ES7210_ADDR, 0x04, 0x01);   // LRCK divider high
+    i2c_write_reg(ES7210_ADDR, 0x05, 0x00);   // LRCK divider low
+
+    // I2S format: 16-bit word length, normal I2S, ADC12→SDOUT1
+    i2c_write_reg(ES7210_ADDR, 0x11, 0x60);   // SP_WL=011 (16-bit), I2S format
+    i2c_write_reg(ES7210_ADDR, 0x12, 0x00);   // SDOUT_MODE=00 (ADC12→SDOUT1)
+
+    // Enable MIC1 + MIC2, max gain
+    i2c_write_reg(ES7210_ADDR, 0x4B, 0xFF);   // MIC12 power off
+    i2c_write_reg(ES7210_ADDR, 0x4C, 0xFF);   // MIC34 power off
+    i2c_update_reg(ES7210_ADDR, 0x01, 0x0B, 0x00);  // Ungate ADC clocks
+    i2c_write_reg(ES7210_ADDR, 0x4B, 0x00);   // MIC12 power on
+    // MIC1: enable + max gain (0x0E = 37.5dB)
+    i2c_update_reg(ES7210_ADDR, 0x43, 0x1F, 0x1E);
+    // MIC2: enable + max gain
+    i2c_update_reg(ES7210_ADDR, 0x44, 0x1F, 0x1E);
+
+    codec_available = true;
+    ESP_LOGI(TAG, "ES7210 ADC initialized (MIC1, 24dB, 16kHz)");
+}
+
+static void codec_init(void)
+{
+    if (!board->has_codec) return;
+    // ES8311 disabled — not needed for mic, may conflict on shared I2S data line
+    // es8311_init();
+    es7210_init();
+
+    // Keep PA off — we only need mic input for now
+    if (board->pin_codec_pa >= 0) {
+        gpio_config_t pa_cfg = {
+            .pin_bit_mask = (1ULL << board->pin_codec_pa),
+            .mode = GPIO_MODE_OUTPUT,
+        };
+        gpio_config(&pa_cfg);
+        gpio_set_level(board->pin_codec_pa, 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Microphone (I2S) — measures loudness for pupil dilation
 // ─────────────────────────────────────────────────────────────────────────────
 #define MIC_SAMPLE_RATE  16000
 #define MIC_BUF_SAMPLES  256
 
 static i2s_chan_handle_t mic_handle;
-static float mic_loudness = 0;   // smoothed loudness (0..1)
+static float mic_loudness = 0;        // smoothed loudness (0..1), drives pupil/blink
+static float mic_floor = 0;          // adaptive noise floor (slow-tracking average)
+static float mic_peak = 0;           // decaying peak above floor (for stats)
+static float mic_level = 0;          // current raw mean-abs level (for stats)
+static float mic_sensitivity = 3.0f; // floor multiplier for full loudness
+                                      // loudness=1.0 when level = floor * sensitivity
+static uint8_t mic_gain = 0x0E;      // ES7210 PGA gain (0x00-0x0E)
+static uint8_t prev_mic_gain = 0x0E;
 
 static bool mic_available = false;
 
 static void mic_init(void)
 {
+    if (board->has_codec) {
+        // ES7210 ADC + ES8311 DAC path (1.75" board)
+        codec_init();
+        if (!codec_available) return;
+
+        i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+        ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &mic_handle));
+
+        i2s_std_config_t std_cfg = {
+            .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+            .gpio_cfg = {
+                .mclk = board->pin_codec_mclk,
+                .bclk = board->pin_codec_bclk,
+                .ws   = board->pin_codec_ws,
+                .din  = board->pin_codec_din,
+                .dout = I2S_GPIO_UNUSED,
+                .invert_flags = { false, false, false },
+            },
+        };
+        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+
+        ESP_ERROR_CHECK(i2s_channel_init_std_mode(mic_handle, &std_cfg));
+        ESP_ERROR_CHECK(i2s_channel_enable(mic_handle));
+        mic_available = true;
+        ESP_LOGI(TAG, "Microphone ready (ES8311 codec, I2S %d Hz)", MIC_SAMPLE_RATE);
+        return;
+    }
+
+    // PDM mic path (1.46" board)
     if (board->pin_mic_sd < 0) {
-        ESP_LOGI(TAG, "No PDM mic on this board — mic_loudness stays 0");
+        ESP_LOGI(TAG, "No mic on this board — mic_loudness stays 0");
         return;
     }
 
@@ -765,35 +936,93 @@ static void mic_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(mic_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(mic_handle));
     mic_available = true;
-    ESP_LOGI(TAG, "Microphone ready (I2S %d Hz)", MIC_SAMPLE_RATE);
+    ESP_LOGI(TAG, "Microphone ready (PDM, I2S %d Hz)", MIC_SAMPLE_RATE);
 }
 
 /** Read a block of mic samples and return RMS loudness (0..1). */
 static float mic_read_loudness(void)
 {
     if (!mic_available) return 0;
-    int32_t buf[MIC_BUF_SAMPLES];
-    size_t bytes_read = 0;
-    esp_err_t err = i2s_channel_read(mic_handle, buf, sizeof(buf), &bytes_read, 0);
-    if (err != ESP_OK || bytes_read == 0) return mic_loudness;
 
-    int samples = bytes_read / sizeof(int32_t);
-    int64_t sum_sq = 0;
-    for (int i = 0; i < samples; i++) {
-        int32_t s = buf[i] >> 8;  // 24-bit data in 32-bit frame
-        sum_sq += (int64_t)s * s;
+    // Apply gain change from BLE — just update gain registers, no reset
+    if (board->has_codec && mic_gain != prev_mic_gain) {
+        if (mic_gain > 0x0E) mic_gain = 0x0E;
+        // Write PGA gain directly (bits 3:0), keep SELMIC bit 4 set
+        i2c_update_reg(ES7210_ADDR, 0x43, 0x0F, mic_gain);
+        i2c_update_reg(ES7210_ADDR, 0x44, 0x0F, mic_gain);
+        prev_mic_gain = mic_gain;
+        uint8_t r43 = 0;
+        i2c_read_reg(ES7210_ADDR, 0x43, &r43, 1);
+        ESP_LOGI(TAG, "ES7210 gain=%d (reg43=0x%02X)", mic_gain, r43);
     }
-    float rms = sqrtf((float)(sum_sq / samples));
+    size_t bytes_read = 0;
 
-    // Normalize — typical I2S mic range, adjust if needed
-    float level = rms / 100000.0f;
-    if (level > 1.0f) level = 1.0f;
+    int64_t sum_sq = 0;
+    int samples = 0;
+    float rms;
 
-    // Smooth: fast attack, slow decay
-    if (level > mic_loudness)
-        mic_loudness = mic_loudness * 0.3f + level * 0.7f;
+    if (board->has_codec) {
+        // 16-bit stereo — read interleaved L/R, use left channel
+        int16_t buf16[MIC_BUF_SAMPLES * 2];  // stereo pairs
+        esp_err_t err = i2s_channel_read(mic_handle, buf16, sizeof(buf16), &bytes_read, 0);
+        if (err != ESP_OK || bytes_read == 0) return mic_loudness;
+        int total = bytes_read / sizeof(int16_t);
+        for (int i = 0; i < total; i += 2) {  // step by 2 for stereo, use left
+            int32_t s = buf16[i];
+            sum_sq += (int64_t)s * s;
+            samples++;
+        }
+        rms = sqrtf((float)(sum_sq / (samples > 0 ? samples : 1)));
+    } else {
+        // PDM mic: 32-bit mono
+        int32_t buf32[MIC_BUF_SAMPLES];
+        esp_err_t err = i2s_channel_read(mic_handle, buf32, sizeof(buf32), &bytes_read, 0);
+        if (err != ESP_OK || bytes_read == 0) return mic_loudness;
+        samples = bytes_read / sizeof(int32_t);
+        for (int i = 0; i < samples; i++) {
+            int32_t s = buf32[i] >> 8;  // 24-bit data in 32-bit frame
+            sum_sq += (int64_t)s * s;
+        }
+        rms = sqrtf((float)(sum_sq / samples));
+    }
+
+    // Compute mean absolute value (more intuitive than RMS for this purpose)
+    float mean_abs = rms;  // RMS is close enough to mean-abs for our purposes
+
+    // Update current level stat
+    mic_level = mean_abs;
+
+    // Adaptive noise floor: very slow tracking so it represents ambient level
+    // Fast rise (new environment), very slow fall (don't lose floor during quiet moments)
+    if (mean_abs > mic_floor)
+        mic_floor = mic_floor * 0.99f + mean_abs * 0.01f;   // slow rise
     else
-        mic_loudness = mic_loudness * 0.9f + level * 0.1f;
+        mic_floor = mic_floor * 0.999f + mean_abs * 0.001f;  // very slow fall
+
+    // Seed the floor on first samples
+    if (mic_floor < 1.0f) mic_floor = mean_abs;
+
+    // Peak tracking: fast attack, slow decay (shows recent loud events)
+    if (mean_abs > mic_peak)
+        mic_peak = mic_peak * 0.3f + mean_abs * 0.7f;
+    else
+        mic_peak = mic_peak * 0.995f + mean_abs * 0.005f;
+
+    // Loudness = how far above the noise floor, scaled by sensitivity
+    // At level == floor → loudness = 0
+    // At level == floor * sensitivity → loudness = 1.0
+    float excess = mean_abs - mic_floor;
+    float loudness_target = 0;
+    if (excess > 0 && mic_floor > 0) {
+        loudness_target = excess / (mic_floor * (mic_sensitivity - 1.0f));
+        if (loudness_target > 1.0f) loudness_target = 1.0f;
+    }
+
+    // Smooth: fast attack, moderate decay
+    if (loudness_target > mic_loudness)
+        mic_loudness = mic_loudness * 0.3f + loudness_target * 0.7f;
+    else
+        mic_loudness = mic_loudness * 0.85f + loudness_target * 0.15f;
 
     return mic_loudness;
 }
@@ -1611,7 +1840,87 @@ static void render_task(void *arg)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Battery power latch
+// Battery state (shared by ADC and PMIC paths)
+// ─────────────────────────────────────────────────────────────────────────────
+static float battery_voltage = 0;
+static float battery_percent = 0;
+static float bat_adc_raw = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AXP2101 PMIC (1.75" board) — battery monitoring + power control
+// ─────────────────────────────────────────────────────────────────────────────
+#define AXP2101_ADDR        0x34
+
+// ADC control
+#define AXP2101_ADC_CTRL    0x30   // ADC enable register
+#define AXP2101_ADC_VBAT_EN (1<<0) // Bit 0: enable VBAT ADC
+
+// Battery voltage: 14-bit, 1mV/LSB
+#define AXP2101_VBAT_H      0x78   // Bits [13:6]
+#define AXP2101_VBAT_L      0x79   // Bits [5:0]
+
+// Charge status
+#define AXP2101_STATUS1      0x00
+#define AXP2101_STATUS2      0x01
+
+// Power off
+#define AXP2101_PWROFF_EN    0x10  // Bit 0: power off
+
+static bool pmic_available = false;
+
+static void axp2101_init(void)
+{
+    if (!board->has_pmic) return;
+
+    // Verify chip is present
+    uint8_t val = 0;
+    esp_err_t err = i2c_read_reg(AXP2101_ADDR, AXP2101_STATUS1, &val, 1);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "AXP2101 not found at 0x%02X", AXP2101_ADDR);
+        return;
+    }
+
+    // Enable VBAT ADC
+    i2c_read_reg(AXP2101_ADDR, AXP2101_ADC_CTRL, &val, 1);
+    val |= AXP2101_ADC_VBAT_EN;
+    i2c_write_reg(AXP2101_ADDR, AXP2101_ADC_CTRL, val);
+
+    pmic_available = true;
+    ESP_LOGI(TAG, "AXP2101 PMIC initialized (battery ADC enabled)");
+}
+
+static void axp2101_read_battery(void)
+{
+    if (!pmic_available) return;
+
+    uint8_t hi = 0, lo = 0;
+    i2c_read_reg(AXP2101_ADDR, AXP2101_VBAT_H, &hi, 1);
+    i2c_read_reg(AXP2101_ADDR, AXP2101_VBAT_L, &lo, 1);
+
+    // 14-bit value: hi[7:0] = bits 13..6, lo[5:0] = bits 5..0
+    uint16_t raw = ((uint16_t)hi << 6) | (lo & 0x3F);
+    battery_voltage = raw / 1000.0f;  // 1mV per LSB → volts
+
+    // Li-ion approximate charge curve (3.3V=0%, 4.2V=100%)
+    float pct = (battery_voltage - 3.3f) / (4.2f - 3.3f) * 100.0f;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    battery_percent = pct;
+}
+
+static void axp2101_power_off(void)
+{
+    if (!pmic_available) return;
+    ESP_LOGW(TAG, "AXP2101 power off!");
+    uint8_t val = 0;
+    i2c_read_reg(AXP2101_ADDR, AXP2101_PWROFF_EN, &val, 1);
+    val |= 0x01;
+    i2c_write_reg(AXP2101_ADDR, AXP2101_PWROFF_EN, val);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Battery power latch (1.46" board) + unified battery interface
 // ─────────────────────────────────────────────────────────────────────────────
 static void power_latch_init(void)
 {
@@ -1646,6 +1955,10 @@ static void power_latch_init(void)
 
 static void power_off(void)
 {
+    if (board->has_pmic) {
+        axp2101_power_off();
+        return;
+    }
     if (board->pin_bat_control < 0) return;
     ESP_LOGW(TAG, "Powering off!");
     gpio_set_level(board->pin_bat_control, 0);
@@ -1654,15 +1967,15 @@ static void power_off(void)
 
 // Battery ADC — GPIO8 has a ÷3 voltage divider, so battery_V = adc_V * 3
 static adc_oneshot_unit_handle_t bat_adc_handle;
-static float battery_voltage = 0;
-static float battery_percent = 0;
 
-static void battery_adc_init(void)
+static void battery_init(void)
 {
-    if (board->pin_bat_adc < 0) {
-        ESP_LOGI(TAG, "No battery ADC on this board (PMIC manages battery)");
+    if (board->has_pmic) {
+        axp2101_init();
         return;
     }
+
+    if (board->pin_bat_adc < 0) return;
 
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = ADC_UNIT_1,
@@ -1677,11 +1990,14 @@ static void battery_adc_init(void)
     adc_oneshot_config_channel(bat_adc_handle, ADC_CHANNEL_7, &chan_cfg);
 }
 
-static float bat_adc_raw = 0;
-
-static float battery_read_voltage(void)
+static void battery_read_voltage(void)
 {
-    if (board->pin_bat_adc < 0) return 0;
+    if (board->has_pmic) {
+        axp2101_read_battery();
+        return;
+    }
+
+    if (board->pin_bat_adc < 0) return;
     int raw_int = 0;
     adc_oneshot_read(bat_adc_handle, ADC_CHANNEL_7, &raw_int);
     bat_adc_raw = (float)raw_int;
@@ -1695,21 +2011,20 @@ static float battery_read_voltage(void)
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     battery_percent = pct;
-
-    return battery_voltage;
 }
 
 #define PWR_BUTTON_SHUTDOWN_MS  2000  // Hold 2s to power off
 
 void app_main(void)
 {
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+
     // Detect which board we're on BEFORE any hardware init
     board = detect_board();
     lcd_pixels = board->lcd_w * board->lcd_h;
     ESP_LOGI(TAG, "Eyeball starting up — Board: %s", board->name);
 
     power_latch_init();
-    battery_adc_init();
 
     // Double framebuffers in PSRAM
     framebuf[0] = heap_caps_malloc(lcd_pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
@@ -1728,6 +2043,7 @@ void app_main(void)
     flush_done_sem  = xSemaphoreCreateBinary();
 
     i2c_init();
+    battery_init();
     tca9554_init();
     lcd_init();
     te_init();
@@ -1759,10 +2075,16 @@ void app_main(void)
         { 0x001C, "Blob Color A",      BLE_PARAM_RW,   &blob_color_a,          3 },
         { 0x001D, "Blob Color B",      BLE_PARAM_RW,   &blob_color_b,          3 },
         { 0x0020, "Mic Loudness",        BLE_PARAM_STAT, &mic_loudness,          4 },
+        { 0x0026, "Mic Level",          BLE_PARAM_STAT, &mic_level,            4 },
+        { 0x0027, "Mic Floor",          BLE_PARAM_STAT, &mic_floor,            4 },
+        { 0x0028, "Mic Gain",          BLE_PARAM_RW,   &mic_gain,             1 },
+        { 0x0029, "Mic Peak",           BLE_PARAM_STAT, &mic_peak,             4 },
+        { 0x002A, "Mic Sensitivity",   BLE_PARAM_RW,   &mic_sensitivity,      4 },
         { 0x0021, "FPS",                 BLE_PARAM_STAT, &current_fps,           4 },
         { 0x0022, "Battery V",          BLE_PARAM_STAT, &battery_voltage,       4 },
         { 0x0023, "Battery %",          BLE_PARAM_STAT, &battery_percent,       4 },
         { 0x0024, "BAT ADC Raw",       BLE_PARAM_STAT, &bat_adc_raw,           4 },
+        { 0x0025, "Brightness",        BLE_PARAM_RW,   &display_brightness,    1 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
@@ -1894,6 +2216,12 @@ void app_main(void)
         // Start Core 1 rendering into back buffer
         xSemaphoreGive(flush_done_sem);
 
+        // Apply brightness if changed via BLE (CO5300 only)
+        if (display_brightness != prev_brightness && !board->has_backlight_gpio) {
+            esp_lcd_panel_co5300_set_brightness(panel, display_brightness);
+            prev_brightness = display_brightness;
+        }
+
         int64_t t1 = esp_timer_get_time();
 
         // Flush front buffer — Core 1 is rendering in parallel
@@ -1931,7 +2259,10 @@ void app_main(void)
             perf_sensor_us = perf_flush_us = perf_wait_us = 0;
 
             battery_read_voltage();
-            if (board->pin_bat_control >= 0) {
+            if (board->has_pmic) {
+                ESP_LOGI(TAG, "PWR: PMIC BAT=%.2fV (%.0f%%)",
+                         battery_voltage, battery_percent);
+            } else if (board->pin_bat_control >= 0) {
                 ESP_LOGI(TAG, "PWR: BAT_CTRL(IO%d)=%d KEY_BAT(IO%d)=%d BAT=%.2fV (raw=%.0f adc=%.3fV)",
                          board->pin_bat_control, gpio_get_level(board->pin_bat_control),
                          board->pin_key_bat, gpio_get_level(board->pin_key_bat),

@@ -142,6 +142,9 @@ struct ParameterView: View {
         case "0016": return (0.03, 0.12)     // Spiral speed
         case "001B": return (0.2, 3.0)       // Blob speed
         case "001E": return (0.0, 1.0)       // Blob pulse threshold
+        case "0025": return (0.0, 100.0)     // Brightness (0-100%)
+        case "0028": return (0.0, 14.0)     // Mic gain (ES7210: 0-14)
+        case "002A": return (1.5, 10.0)     // Mic sensitivity (floor multiplier)
         default: return (0.0, 100.0)
         }
     }

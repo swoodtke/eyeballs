@@ -181,6 +181,12 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         case "0022": return "Battery V"
         case "0023": return "Battery %"
         case "0024": return "BAT ADC Raw"
+        case "0025": return "Brightness"
+        case "0026": return "Mic Level"
+        case "0027": return "Mic Floor"
+        case "0028": return "Mic Gain"
+        case "0029": return "Mic Peak"
+        case "002A": return "Mic Sensitivity"
         default: return "Unknown (\(uuid.uuidString))"
         }
     }

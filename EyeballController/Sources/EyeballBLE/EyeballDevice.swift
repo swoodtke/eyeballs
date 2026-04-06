@@ -74,7 +74,7 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
     private static let catEyeUUIDs: Set<String> = ["0011", "0012", "0013", "0014"]
     private static let hypnotoadUUIDs: Set<String> = ["0015", "0016", "0017", "0018", "0019", "001A"]
     private static let blobEyeUUIDs: Set<String> = ["001B", "001C", "001D", "001E"]
-    private static let globalUUIDs: Set<String> = ["0010"]  // Display Mode
+    private static let globalUUIDs: Set<String> = ["0010", "0025", "0028", "002A"]  // Display Mode, Brightness, Mic Gain, Mic Sensitivity
 
     /// Parameters for the current display mode + global params.
     public var modeParameters: [CharacteristicEntry] {
