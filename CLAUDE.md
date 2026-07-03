@@ -16,8 +16,9 @@ Animated eyeball display on a Waveshare ESP32-S3-Touch-LCD-1.46 (412x412 round A
 ### Firmware
 ```bash
 idf.py build
+idf.py -p /dev/tty.usbmodem101 flash
 ```
-ESP-IDF must be sourced first (`. $IDF_PATH/export.sh`). The user handles flashing — do not run `idf.py flash`.
+The environment already has ESP-IDF sourced — `idf.py` works directly, no need for `export.sh` (ESP-IDF lives at `~/Projects/esp/esp-idf` if you ever need it). The serial port matches `/dev/tty.usbmodem*` (not `/dev/cu.*`); find it with `ls /dev/tty.usbmodem*` since the number can change. Do not run `idf.py monitor` — it's interactive and will hang the shell.
 
 ### macOS app
 ```bash
@@ -25,7 +26,7 @@ cd EyeballController && swift build
 ```
 
 ## Workflow
-- **I build firmware, user flashes.** Always run `idf.py build` after firmware changes. Never run flash/monitor commands.
+- **Build and flash firmware directly.** Always run `idf.py build` after firmware changes, then flash with `idf.py -p /dev/tty.usbmodem* flash`. If flashing fails, the board may be disconnected — tell the user rather than retrying. Never run monitor commands.
 - **Rebuild firmware when changing C files.** The app only needs rebuilding for Swift changes.
 - **CoreBluetooth caches aggressively.** If new BLE characteristics don't appear after flashing, the user may need to toggle Bluetooth off/on in System Settings.
 
