@@ -1385,10 +1385,16 @@ static uint8_t spiral_color_c[3] = {  80,  40, 220 };  // indigo
 static uint8_t spiral_color_d[3] = { 160,  30, 200 };  // violet
 
 // Precomputed LUTs for spiral — store angle and log-dist separately
-// so zoom can be applied at draw time without trig
-static uint8_t *spiral_angle_lut = NULL;  // angle_component * 256
-static uint8_t *spiral_dist_lut  = NULL;  // log(dist) * 256 (pre-scaled by 1.0)
-static uint8_t *spiral_mask      = NULL;  // 1 = inside circle, 0 = outside
+// so zoom can be applied at draw time without trig.
+// 16-bit: 8-bit LUTs made the field visibly stair-step (angle steps span ~5px
+// arcs at the rim; dist steps get amplified by zoom into chunky radial bands).
+static uint16_t *spiral_angle_lut = NULL;  // angle/(2*PI) * 65536
+static uint16_t *spiral_dist_lut  = NULL;  // log(dist) * SPIRAL_DIST_SCALE (mod 65536)
+static uint8_t  *spiral_mask      = NULL;  // 1 = inside circle, 0 = outside
+
+// log(dist) fixed-point scale. Wrap-around past 65535 is harmless: the field
+// is cyclic and the draw loop multiplies by an integer, so mod-2^16 survives.
+#define SPIRAL_DIST_SCALE 12288.0f
 
 static void spiral_lut_init(void)
 {
@@ -1397,8 +1403,8 @@ static void spiral_lut_init(void)
     const int CX = board->eye_cx, CY = board->eye_cy;
     const float SR = (float)board->sclera_r;
 
-    spiral_angle_lut = heap_caps_malloc(lcd_pixels, MALLOC_CAP_SPIRAM);
-    spiral_dist_lut  = heap_caps_malloc(lcd_pixels, MALLOC_CAP_SPIRAM);
+    spiral_angle_lut = heap_caps_malloc(lcd_pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    spiral_dist_lut  = heap_caps_malloc(lcd_pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     spiral_mask      = heap_caps_malloc(lcd_pixels, MALLOC_CAP_SPIRAM);
     if (!spiral_angle_lut || !spiral_dist_lut || !spiral_mask) {
         ESP_LOGE(TAG, "Spiral LUT alloc failed");
@@ -1420,9 +1426,9 @@ static void spiral_lut_init(void)
             spiral_mask[i] = 1;
             float dist = sqrtf(dist_sq);
             float angle = atan2f(dy, dx);
-            spiral_angle_lut[i] = (uint8_t)((int)(angle / (2.0f * M_PI) * 256.0f) & 0xFF);
+            spiral_angle_lut[i] = (uint16_t)((int)(angle / (2.0f * M_PI) * 65536.0f) & 0xFFFF);
             float log_d = (dist > 1.0f) ? logf(dist) : 0;
-            spiral_dist_lut[i] = (uint8_t)((int)(log_d * 48.0f) & 0xFF);
+            spiral_dist_lut[i] = (uint16_t)((int)(log_d * SPIRAL_DIST_SCALE) & 0xFFFF);
         }
     }
     ESP_LOGI(TAG, "Spiral LUT ready (split angle/dist)");
@@ -1436,33 +1442,60 @@ static void spiral_lut_free(void)
     ESP_LOGI(TAG, "Spiral LUT freed");
 }
 
+// 256-entry palette indexed by the top 8 bits of the 16-bit spiral field:
+// 4 bands of 64 entries, with a short linear blend across each band boundary
+// so edges anti-alias instead of hard-switching colour.
+#define SPIRAL_BLEND_W 3  // blend half-width in palette entries
+
+static uint16_t spiral_pal256[256];
+
+static void spiral_palette_build(void)
+{
+    const uint8_t *cols[4] = { spiral_color_a, spiral_color_b, spiral_color_c, spiral_color_d };
+    for (int j = 0; j < 256; j++) {
+        int b = j >> 6, p = j & 63;
+        const uint8_t *c0 = cols[b], *c1 = cols[b];
+        int t = 0;  // blend position, 0..2W over the boundary
+        if (p < SPIRAL_BLEND_W) {
+            c0 = cols[(b + 3) & 3];
+            c1 = cols[b];
+            t = p + SPIRAL_BLEND_W;
+        } else if (p >= 64 - SPIRAL_BLEND_W) {
+            c0 = cols[b];
+            c1 = cols[(b + 1) & 3];
+            t = p - (64 - SPIRAL_BLEND_W);
+        }
+        uint8_t r = c0[0] + (c1[0] - c0[0]) * t / (2 * SPIRAL_BLEND_W);
+        uint8_t g = c0[1] + (c1[1] - c0[1]) * t / (2 * SPIRAL_BLEND_W);
+        uint8_t bl = c0[2] + (c1[2] - c0[2]) * t / (2 * SPIRAL_BLEND_W);
+        spiral_pal256[j] = rgb(r, g, bl);
+    }
+}
+
 static void eye_draw_hypnotoad(void)
 {
     if (!spiral_angle_lut) return;
 
-    uint16_t palette[4] = {
-        rgb(spiral_color_a[0], spiral_color_a[1], spiral_color_a[2]),
-        rgb(spiral_color_b[0], spiral_color_b[1], spiral_color_b[2]),
-        rgb(spiral_color_c[0], spiral_color_c[1], spiral_color_c[2]),
-        rgb(spiral_color_d[0], spiral_color_d[1], spiral_color_d[2]),
-    };
+    spiral_palette_build();
 
-    uint8_t phase_offset = (uint8_t)((int)(spiral_phase * 256.0f) & 0xFF);
-    // dist_lut stores log(dist)*48. We want: dist_component = log(dist)*zoom*256/(2*PI)
-    // = dist_lut * zoom * 256 / (48 * 2 * PI)
-    // ≈ dist_lut * zoom * 0.8488
-    uint16_t zoom_mult = (uint16_t)(spiral_zoom * 256.0f * 256.0f / (48.0f * 2.0f * 3.14159f));
+    uint16_t phase_offset = (uint16_t)((int)(spiral_phase * 65536.0f) & 0xFFFF);
+    // dist_lut stores log(dist)*SPIRAL_DIST_SCALE. We want:
+    //   dist_component = log(dist)*zoom*65536/(2*PI)  (mod 65536)
+    // so multiply by zoom*65536/(2*PI*SPIRAL_DIST_SCALE) in Q16.
+    // The 32-bit product wraps mod 2^32, which preserves the result mod 2^16
+    // after the >>16 — no widening needed.
+    uint32_t zoom_mult = (uint32_t)(spiral_zoom * 65536.0f * 65536.0f
+                                    / (SPIRAL_DIST_SCALE * 2.0f * (float)M_PI));
 
     uint16_t black = COL_BLACK;
     for (int i = 0; i < lcd_pixels; i++) {
         if (!spiral_mask[i]) {
             draw_fb[i] = black;
         } else {
-            uint8_t ang = spiral_angle_lut[i];
-            uint8_t dist_val = (uint8_t)((spiral_dist_lut[i] * zoom_mult) >> 8);
-            uint8_t combined = ang + dist_val - phase_offset;
-            uint8_t band = (combined >> 6) & 0x03;
-            draw_fb[i] = palette[band];
+            uint16_t ang = spiral_angle_lut[i];
+            uint16_t dist_val = (uint16_t)(((uint32_t)spiral_dist_lut[i] * zoom_mult) >> 16);
+            uint16_t combined = (uint16_t)(ang + dist_val - phase_offset);
+            draw_fb[i] = spiral_pal256[combined >> 8];
         }
     }
 
@@ -2148,6 +2181,7 @@ void app_main(void)
 
         spiral_phase += spiral_speed;
         if (spiral_phase > 1.0f) spiral_phase -= 1.0f;
+        if (spiral_phase < 0.0f) spiral_phase += 1.0f;
         // Sauron periodic blink — narrow to thin slit every ~4 seconds
         // Sauron periodic blink: close → hold → reopen
         switch (sauron_blink_state) {
