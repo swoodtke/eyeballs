@@ -54,6 +54,7 @@ def load_blob_frames(path):
 
     w, h, num_frames, pal_size = struct.unpack_from("<HHHH", data, 0)
     bpp = data[8]
+    playback = data[9]  # 0=ping-pong, 1=loop
 
     pal_offset = 16
     pal = np.frombuffer(data, dtype=np.uint8, count=pal_size * 3, offset=pal_offset).reshape(pal_size, 3)
@@ -75,7 +76,7 @@ def load_blob_frames(path):
         frames[i] = pixels.reshape(h, w)
 
     print(f"Loaded {num_frames} frames at {w}×{h}, {pal_size} colors, {bpp}-bit RLE")
-    return w, h, num_frames, pal, frames
+    return w, h, num_frames, pal, frames, playback
 
 
 def main():
@@ -88,7 +89,7 @@ def main():
         print("Usage: preview_blob.py [path_to_frames.bin]")
         sys.exit(1)
 
-    w, h, num_frames, pal, frames = load_blob_frames(bin_path)
+    w, h, num_frames, pal, frames, playback = load_blob_frames(bin_path)
 
     scale = 2
     disp_w, disp_h = w * scale, h * scale
@@ -139,8 +140,8 @@ def main():
             root.destroy()
 
     root.bind("<Key>", on_key)
-    # Default to loop mode if filename contains "sauron"
-    if "sauron" in str(bin_path).lower():
+    # Playback mode comes from the header (0=ping-pong, 1=loop)
+    if playback == 1:
         pingpong[0] = False
     print(f"Controls: Space=pause, Left/Right=step, L=toggle loop/pingpong, Q=quit")
     print(f"Playback: {'ping-pong' if pingpong[0] else 'loop'}")
