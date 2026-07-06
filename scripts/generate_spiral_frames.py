@@ -11,15 +11,17 @@ Encoding: 6-bit bitstream
   - Non-zero 6 bits: literal pixel (color 1-63)
   - Zero 6 bits: RLE marker -> next 6 bits = color, next 6 bits = count (1-63)
 
-Frames are drawn by the firmware at 2x scale, so 208x208 fills the
-412px round display.
+Frames are drawn by the firmware at 2x scale, sized for the larger
+1.75" board (233x233 -> 466px). On the 1.46" (412px) the firmware's
+centered blit crops the overhanging edges, which is harmless for a
+radially-centered animation.
 """
 
 import struct
 import numpy as np
 from pathlib import Path
 
-W, H = 208, 208
+W, H = 233, 233
 NUM_FRAMES = 360
 PALETTE_SIZE = 64
 

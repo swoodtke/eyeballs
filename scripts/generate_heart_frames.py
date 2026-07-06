@@ -26,7 +26,7 @@ PALETTE_SIZE = 64
 SUPERSAMPLE = 2       # render the mask at 2x for antialiased edges
 
 HEART_REST = 26.0     # px per unit of the implicit heart curve, at rest
-HEART_PEAK = 78.0     # scale at full beat — nearly fills the display
+HEART_PEAK = 63.0     # scale at full beat — fills the display's round crop
 GLOW_RADIUS = 12.0    # Gaussian blur radius for the outer glow, px
 GLOW_GAIN = 0.55      # glow strength relative to the heart body
 
