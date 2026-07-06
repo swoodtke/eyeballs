@@ -54,8 +54,9 @@ static int lcd_pixels;  // board->lcd_w * board->lcd_h, set once
 #define EXIO_TP_RST    (1 << 1)   // EXIO1
 #define EXIO_LCD_RST   (1 << 2)   // EXIO2
 
-typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_BLOB_EYE, MODE_SAURON } display_mode_t;
-#define NUM_MODES 4
+typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_BLOB_EYE, MODE_SAURON,
+               MODE_SPIRAL_RINGS, MODE_HEART } display_mode_t;
+#define NUM_MODES 6
 static display_mode_t display_mode = MODE_CAT_EYE;
 static float current_fps = 0;
 static uint8_t display_brightness = 100;  // 0-100%, only used on CO5300 (1.75" board)
@@ -74,6 +75,7 @@ static esp_lcd_panel_handle_t panel;
 // Dual-core synchronisation
 static SemaphoreHandle_t render_done_sem;  // Core 1 → Core 0: frame rendered
 static SemaphoreHandle_t flush_done_sem;   // Core 0 → Core 1: back buffer safe
+static SemaphoreHandle_t flush_dma_sem;    // SPI ISR → Core 0: frame DMA drained
 
 // Snapshot of all render inputs passed from Core 0 → Core 1
 typedef struct {
@@ -329,6 +331,15 @@ static const co5300_lcd_init_cmd_t co5300_init_cmds[] = {
     {0x29, NULL,          0, 0},   // Display on
 };
 
+static bool IRAM_ATTR lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t io,
+                                              esp_lcd_panel_io_event_data_t *edata,
+                                              void *user_ctx)
+{
+    BaseType_t wake = pdFALSE;
+    xSemaphoreGiveFromISR(flush_dma_sem, &wake);
+    return wake == pdTRUE;
+}
+
 static void lcd_init(void)
 {
     // Backlight off during init (only 1.46" has a backlight GPIO)
@@ -372,11 +383,17 @@ static void lcd_init(void)
         .lcd_cmd_bits       = 32,
         .lcd_param_bits     = 8,
         .spi_mode           = board->spi_mode,
-        .trans_queue_depth  = 10,
+        // Frames are sent as one draw_bitmap, chunked by max_transfer_sz.
+        // Each in-flight chunk needs an internal-RAM bounce buffer (the
+        // framebuffer is in PSRAM), so keep depth × chunk size bounded.
+        .trans_queue_depth  = 4,
+        .on_color_trans_done = lcd_color_trans_done_cb,
         .flags = {
             .quad_mode = true,
         },
     };
+    // Given by the trans-done ISR when the last DMA chunk of a frame completes
+    flush_dma_sem = xSemaphoreCreateBinary();
 
     spi_bus_config_t bus_cfg = {
         .data0_io_num   = board->pin_lcd_sda0,
@@ -384,7 +401,10 @@ static void lcd_init(void)
         .data2_io_num   = board->pin_lcd_sda2,
         .data3_io_num   = board->pin_lcd_sda3,
         .sclk_io_num    = board->pin_lcd_sck,
-        .max_transfer_sz = board->lcd_w * (board->lcd_h / 4) * sizeof(uint16_t),
+        // Chunk size for color transfers: small enough that 4 in-flight
+        // bounce buffers fit in internal RAM, big enough to amortize the
+        // per-chunk ISR overhead. Copy of chunk N+1 overlaps DMA of chunk N.
+        .max_transfer_sz = 30720,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
@@ -651,20 +671,28 @@ static void te_init(void)
     gpio_isr_handler_add(board->pin_lcd_te, te_isr, NULL);
 }
 
-/** Push front buffer to display in 4 strips.
- *  Each strip must fit in the SPI DMA internal bounce buffer. */
-#define FLUSH_STRIPS 4
-
+/** Push the front buffer to the display as one draw_bitmap call.
+ *  The esp_lcd SPI IO layer splits it into hardware-max DMA chunks that
+ *  pipeline back-to-back with CS held — one CASET/RASET setup per frame.
+ *  (Flushing in strips forced a pipeline drain + 3 synchronous command
+ *  transactions per strip, stretching the write past one panel refresh.) */
 static void lcd_flush(void)
 {
     const int W = board->lcd_w, H = board->lcd_h;
-    uint16_t *base = framebuf[front_idx];
-    int strip_h = H / FLUSH_STRIPS;
-    for (int s = 0; s < FLUSH_STRIPS; s++) {
-        int y0 = s * strip_h;
-        int y1 = (s == FLUSH_STRIPS - 1) ? H : y0 + strip_h;
-        esp_lcd_panel_draw_bitmap(panel, 0, y0, W, y1, base + y0 * W);
+
+    // Start writing right after a TE (vsync) pulse so the GRAM write stays
+    // behind the panel's scan-out instead of crossing it mid-frame
+    if (board->pin_lcd_te >= 0) {
+        xSemaphoreTake(te_sem, 0);                  // drain a stale pulse
+        xSemaphoreTake(te_sem, pdMS_TO_TICKS(25));  // wait for the next one
     }
+
+    esp_lcd_panel_draw_bitmap(panel, 0, 0, W, H, framebuf[front_idx]);
+
+    // Block until the DMA has drained (callback fires on the last chunk):
+    // this buffer becomes the render target next iteration, and Core 1
+    // must not overwrite it while the SPI is still streaming from it
+    xSemaphoreTake(flush_dma_sem, pdMS_TO_TICKS(100));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1519,7 +1547,10 @@ static uint8_t blob_color_b[3] = {  12,   2,   1 };  // background tint (unused 
 #include "esp_partition.h"
 
 static uint16_t anim_palette_rgb565[64];
-static uint8_t *anim_all_frames = NULL;
+static uint8_t *anim_comp_data = NULL;    // all compressed frames (PSRAM)
+static uint32_t *anim_offsets = NULL;     // per-frame offsets into anim_comp_data
+static uint32_t anim_comp_size = 0;
+static uint8_t *anim_frame_buf = NULL;    // one decoded frame (PSRAM)
 static int anim_frame_w, anim_frame_h, anim_num_frames;
 static int anim_frame_idx = 0;
 static int anim_frame_dir = 1;  // ping-pong direction
@@ -1581,6 +1612,8 @@ static bool anim_find_in_partition(const esp_partition_t *part, const char *name
     return false;
 }
 
+static void anim_free(void);
+
 static void anim_init(const char *name)
 {
     const esp_partition_t *part = esp_partition_find_first(
@@ -1603,6 +1636,11 @@ static void anim_init(const char *name)
     int pal_size    = hdr[6] | (hdr[7] << 8);
     anim_playback   = hdr[9];  // 0=ping-pong, 1=loop
 
+    if (pal_size <= 0 || pal_size > 64) {
+        ESP_LOGE(TAG, "Anim '%s': bad palette size %d", name, pal_size);
+        return;
+    }
+
     // Read palette
     uint8_t pal_rgb[64 * 3];
     esp_partition_read(part, anim_offset + 16, pal_rgb, pal_size * 3);
@@ -1618,71 +1656,64 @@ static void anim_init(const char *name)
     }
     esp_partition_read(part, offset_table_pos, offsets, anim_num_frames * 4);
 
-    // Allocate all decoded frames in PSRAM
+    // Keep frames compressed in PSRAM and decode one per draw call — a full
+    // decode of long animations (e.g. spiral: 360 frames = 15 MB) would not
+    // fit in the 8 MB PSRAM.
     int frame_pixels = anim_frame_w * anim_frame_h;
-    int total = frame_pixels * anim_num_frames;
-    anim_all_frames = heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
-    if (!anim_all_frames) {
-        ESP_LOGE(TAG, "Anim PSRAM alloc failed (%d bytes)", total);
+    uint32_t data_start = offsets[0];
+    anim_comp_size = anim_size - data_start;
+    anim_comp_data = heap_caps_malloc(anim_comp_size + 2, MALLOC_CAP_SPIRAM);
+    anim_frame_buf = heap_caps_malloc(frame_pixels, MALLOC_CAP_SPIRAM);
+    if (!anim_comp_data || !anim_frame_buf) {
+        ESP_LOGE(TAG, "Anim PSRAM alloc failed (%lu bytes)",
+                 (unsigned long)(anim_comp_size + frame_pixels));
         heap_caps_free(offsets);
+        anim_free();
         return;
     }
+    esp_partition_read(part, anim_offset + data_start, anim_comp_data, anim_comp_size);
+    // RLE decoder reads one byte past the current position; keep it in bounds
+    anim_comp_data[anim_comp_size]     = 0;
+    anim_comp_data[anim_comp_size + 1] = 0;
 
-    // Temp buffer for compressed data
-    int max_comp = frame_pixels;
-    uint8_t *comp_buf = heap_caps_malloc(max_comp + 2, MALLOC_CAP_SPIRAM);
-    if (!comp_buf) {
-        ESP_LOGE(TAG, "Anim comp buffer alloc failed");
-        heap_caps_free(offsets);
-        heap_caps_free(anim_all_frames);
-        anim_all_frames = NULL;
-        return;
-    }
-    memset(comp_buf, 0, max_comp + 2);
-
-    // Decode all frames — offsets in the file are relative to file start,
-    // but we need partition-relative, so add anim_offset
-    for (int f = 0; f < anim_num_frames; f++) {
-        int comp_size;
-        if (f + 1 < anim_num_frames)
-            comp_size = offsets[f + 1] - offsets[f];
-        else
-            comp_size = max_comp;
-        if (comp_size > max_comp) comp_size = max_comp;
-
-        esp_partition_read(part, anim_offset + offsets[f], comp_buf, comp_size);
-        anim_decode_rle(comp_buf, comp_size,
-                        anim_all_frames + f * frame_pixels, frame_pixels);
-    }
-
-    heap_caps_free(comp_buf);
-    heap_caps_free(offsets);
+    // Rebase offsets so they index into anim_comp_data
+    for (int f = 0; f < anim_num_frames; f++)
+        offsets[f] -= data_start;
+    anim_offsets = offsets;
 
     anim_frame_idx = 0;
     anim_frame_dir = 1;
     anim_inited = true;
-    ESP_LOGI(TAG, "Anim '%s': %d×%d, %d frames decoded (%.1f MB PSRAM)",
+    ESP_LOGI(TAG, "Anim '%s': %d×%d, %d frames, %.1f MB compressed in PSRAM",
              name, anim_frame_w, anim_frame_h, anim_num_frames,
-             total / (1024.0f * 1024.0f));
+             anim_comp_size / (1024.0f * 1024.0f));
 }
 
 static void anim_free(void)
 {
-    if (anim_all_frames) { heap_caps_free(anim_all_frames); anim_all_frames = NULL; }
+    if (anim_comp_data) { heap_caps_free(anim_comp_data); anim_comp_data = NULL; }
+    if (anim_offsets)   { heap_caps_free(anim_offsets);   anim_offsets = NULL; }
+    if (anim_frame_buf) { heap_caps_free(anim_frame_buf); anim_frame_buf = NULL; }
+    anim_comp_size = 0;
     anim_inited = false;
     ESP_LOGI(TAG, "Anim frames freed");
 }
 
 static void eye_draw_anim(void)
 {
-    if (!anim_all_frames) return;
+    if (!anim_comp_data || !anim_frame_buf) return;
 
     const int W = board->lcd_w, H = board->lcd_h;
     const int CX = board->eye_cx, CY = board->eye_cy;
     const int SR = board->sclera_r;
 
-    const uint8_t *frame = anim_all_frames +
-        anim_frame_idx * anim_frame_w * anim_frame_h;
+    // Decode the current frame from the compressed data in PSRAM
+    int frame_pixels = anim_frame_w * anim_frame_h;
+    uint32_t comp_off = anim_offsets[anim_frame_idx];
+    uint32_t comp_len = (anim_frame_idx + 1 < anim_num_frames
+                         ? anim_offsets[anim_frame_idx + 1] : anim_comp_size) - comp_off;
+    anim_decode_rle(anim_comp_data + comp_off, comp_len, anim_frame_buf, frame_pixels);
+    const uint8_t *frame = anim_frame_buf;
     uint16_t bg = anim_palette_rgb565[0];
     uint16_t black = COL_BLACK;
 
@@ -1701,22 +1732,33 @@ static void eye_draw_anim(void)
         int in_frame_y = (sy >= 0 && sy < scaled_h && fy < anim_frame_h);
         const uint8_t *frame_row = in_frame_y ? frame + fy * anim_frame_w : NULL;
 
-        for (int x = 0; x < W; x++) {
-            int i = row + x;
-            int dxx = x - CX;
-            if (dxx * dxx + dy2 > eye_r2) {
-                draw_fb[i] = black;
-            } else if (frame_row) {
+        // Circle x-span for this row: one sqrt instead of a per-pixel test
+        int cx0 = W, cx1 = -1;
+        if (dy2 <= eye_r2) {
+            int half = (int)sqrtf((float)(eye_r2 - dy2));
+            cx0 = CX - half;     if (cx0 < 0) cx0 = 0;
+            cx1 = CX + half;     if (cx1 >= W) cx1 = W - 1;
+        }
+
+        for (int x = 0; x < cx0; x++)
+            draw_fb[row + x] = black;
+
+        if (frame_row) {
+            for (int x = cx0; x <= cx1; x++) {
                 int sx = x - ox;
                 int fx = sx >> 1;
                 if (sx >= 0 && sx < scaled_w && fx < anim_frame_w)
-                    draw_fb[i] = anim_palette_rgb565[frame_row[fx]];
+                    draw_fb[row + x] = anim_palette_rgb565[frame_row[fx]];
                 else
-                    draw_fb[i] = bg;
-            } else {
-                draw_fb[i] = bg;
+                    draw_fb[row + x] = bg;
             }
+        } else {
+            for (int x = cx0; x <= cx1; x++)
+                draw_fb[row + x] = bg;
         }
+
+        for (int x = cx1 + 1; x < W; x++)
+            draw_fb[row + x] = black;
     }
 
     if (anim_playback == 1) {
@@ -1781,10 +1823,12 @@ static void eye_draw_sauron(void)
 static int mode_log_counter = 0;
 static const char *mode_name(display_mode_t m) {
     switch (m) {
-        case MODE_CAT_EYE:   return "CAT_EYE";
-        case MODE_HYPNOTOAD: return "HYPNOTOAD";
-        case MODE_BLOB_EYE:  return "BLOB_EYE";
-        case MODE_SAURON:    return "SAURON";
+        case MODE_CAT_EYE:      return "CAT_EYE";
+        case MODE_HYPNOTOAD:    return "HYPNOTOAD";
+        case MODE_BLOB_EYE:     return "BLOB_EYE";
+        case MODE_SAURON:       return "SAURON";
+        case MODE_SPIRAL_RINGS: return "SPIRAL_RINGS";
+        case MODE_HEART:        return "HEART";
         default:             return "UNKNOWN";
     }
 }
@@ -1797,18 +1841,22 @@ static void eye_mode_switch(display_mode_t new_mode)
 
     // Free old mode resources
     switch (active_mode) {
-        case MODE_CAT_EYE:   cat_eye_free(); break;
-        case MODE_HYPNOTOAD: spiral_lut_free(); break;
+        case MODE_CAT_EYE:      cat_eye_free(); break;
+        case MODE_HYPNOTOAD:    spiral_lut_free(); break;
         case MODE_BLOB_EYE:
-        case MODE_SAURON:    anim_free(); break;
+        case MODE_SAURON:
+        case MODE_SPIRAL_RINGS:
+        case MODE_HEART:        anim_free(); break;
     }
 
     // Init new mode resources
     switch (new_mode) {
-        case MODE_CAT_EYE:   iris_tex_init(); sclera_lut_init(); break;
-        case MODE_HYPNOTOAD: spiral_lut_init(); break;
-        case MODE_BLOB_EYE:  anim_init("blob"); break;
-        case MODE_SAURON:    anim_init("sauron"); break;
+        case MODE_CAT_EYE:      iris_tex_init(); sclera_lut_init(); break;
+        case MODE_HYPNOTOAD:    spiral_lut_init(); break;
+        case MODE_BLOB_EYE:     anim_init("blob"); break;
+        case MODE_SAURON:       anim_init("sauron"); break;
+        case MODE_SPIRAL_RINGS: anim_init("spiral"); break;
+        case MODE_HEART:        anim_init("heart"); break;
     }
 
     active_mode = new_mode;
@@ -1833,7 +1881,9 @@ static void eye_draw(void)
         eye_draw_hypnotoad();
     else if (display_mode == MODE_SAURON)
         eye_draw_sauron();
-    else if (display_mode == MODE_BLOB_EYE)
+    else if (display_mode == MODE_BLOB_EYE ||
+             display_mode == MODE_SPIRAL_RINGS ||
+             display_mode == MODE_HEART)
         eye_draw_anim();
     else
         eye_draw_cat();
@@ -2226,6 +2276,7 @@ void app_main(void)
             if (blob_pulse < 0) blob_pulse = 0;
         }
 
+        if (ble_display_mode >= NUM_MODES) ble_display_mode = 0;
         display_mode = (display_mode_t)ble_display_mode;
 
         render_params.px           = eye.px;
@@ -2258,20 +2309,23 @@ void app_main(void)
 
         int64_t t1 = esp_timer_get_time();
 
-        // Flush front buffer — Core 1 is rendering in parallel
-        lcd_flush();
+        // --- Wait for Core 1 to finish rendering BEFORE flushing ---
+        // Flushing while Core 1 renders halves PSRAM bandwidth for the DMA,
+        // stretching the GRAM write past one panel refresh period — the
+        // scan-out then laps the write and tears even with TE sync.
+        xSemaphoreTake(render_done_sem, portMAX_DELAY);
 
         int64_t t2 = esp_timer_get_time();
 
-        // --- Wait for Core 1 to finish rendering ---
-        xSemaphoreTake(render_done_sem, portMAX_DELAY);
+        // Flush front buffer — Core 1 idle, DMA gets full PSRAM bandwidth
+        lcd_flush();
 
         int64_t t3 = esp_timer_get_time();
 
         // --- Perf tracking ---
         perf_sensor_us += (t1 - t0);
-        perf_flush_us  += (t2 - t1);
-        perf_wait_us   += (t3 - t2);
+        perf_wait_us   += (t2 - t1);
+        perf_flush_us  += (t3 - t2);
 
         frame_count++;
         int64_t elapsed = now_us - fps_timer_us;

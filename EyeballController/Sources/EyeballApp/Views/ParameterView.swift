@@ -127,7 +127,7 @@ struct ParameterView: View {
 
     private func displayModeNames(for entry: CharacteristicEntry) -> [String]? {
         switch entry.id.uuidString {
-        case "0010": return ["Cat Eye", "Hypnotoad", "Blob Eye", "Sauron"]
+        case "0010": return ["Cat Eye", "Hypnotoad", "Blob Eye", "Sauron", "Spiral Rings", "Heart"]
         default: return nil
         }
     }

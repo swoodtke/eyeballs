@@ -177,7 +177,7 @@ static const board_config_t board_config_175 = {
     .pin_lcd_sda0 = 4, .pin_lcd_sda1 = 5,
     .pin_lcd_sda2 = 6, .pin_lcd_sda3 = 7,
     .pin_lcd_sck  = 38, .pin_lcd_cs = 12,
-    .pin_lcd_te   = -1,   // not available
+    .pin_lcd_te   = 13,   // LCD_TE per schematic; CO5300 TE enabled via cmd 0x35
     .pin_lcd_bl   = -1,   // brightness via cmd 0x51
     .pin_lcd_rst  = 39,   // direct GPIO
 
