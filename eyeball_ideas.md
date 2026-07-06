@@ -83,6 +83,23 @@ opens non-eye territory:
   you move, sand that pours, or a marble rolling in a dish. Delightful because
   they respond physically to the wearer.
 
+## Music beat sync (festival use)
+
+The heart animation is one lub-dub cycle looped, so syncing to music needs no
+new assets — only firmware playback control:
+
+- **Onset-triggered**: detect each bass hit (50–150 Hz Goertzel/FFT energy vs
+  a rolling-average threshold) and restart the loop from frame 0, with a
+  refractory period. Heart slams on every kick drum.
+- **Tempo-matched**: estimate BPM and scale the frame-advance rate so one loop
+  spans one beat period. Smoother; keeps beating through quiet passages.
+
+Loud venues are fine: MEMS mics overload around 120 dB SPL vs ~95–110 dB at a
+festival. If it clips near the stacks, lower the ES7210 input gain (could be a
+BLE param) — and the adaptive threshold self-calibrates to venue volume. The
+same trigger could drive other modes (hypnotoad speed, ring pulse in the
+spiral).
+
 ## Sensor-driven behaviors that upgrade everything
 
 Layers onto existing modes rather than new modes:
