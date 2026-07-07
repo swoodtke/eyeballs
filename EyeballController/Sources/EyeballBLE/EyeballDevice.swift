@@ -50,6 +50,31 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
     @Published public var name: String
     @Published public var isConnecting: Bool = false
     @Published public var isConnected: Bool = false
+    /// True once the device is in the persistent registry (connected at
+    /// least once); known devices auto-reconnect when back in range.
+    @Published public var isKnown: Bool = false
+    /// Smoothed signal strength in dBm; nil until a reading arrives (or
+    /// after disconnect). Raw RSSI is noisy, so readings are blended.
+    @Published public var rssi: Int?
+
+    public func updateRSSI(_ raw: Int) {
+        guard raw < 0, raw > -127 else { return }   // 127 = "unavailable"
+        if let current = rssi {
+            rssi = Int((Double(current) * 0.7 + Double(raw) * 0.3).rounded())
+        } else {
+            rssi = raw
+        }
+    }
+
+    /// Proximity as 1–3 bars (3 = close, 2 = near, 1 = far); 0 = unknown.
+    /// Three buckets ~15 dB apart stay stable against RSSI noise — finer
+    /// steps would flicker.
+    public var signalBars: Int {
+        guard let r = rssi else { return 0 }
+        if r >= -55 { return 3 }
+        if r >= -70 { return 2 }
+        return 1
+    }
     @Published public var characteristics: [CharacteristicEntry] = [] {
         didSet { subscribeToCharacteristics() }
     }
@@ -71,11 +96,16 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
         characteristics.filter { $0.isWritable }
     }
 
-    /// Writable parameters shown in the dashboard. The firmware exposes a
-    /// deliberately minimal set right now; when mode-specific params return,
-    /// per-mode filtering can come back with them.
-    public var modeParameters: [CharacteristicEntry] {
-        parameters.filter { $0.id.uuidString != "0001" }  // name handled separately
+    /// The Display Mode characteristic (generic device control).
+    public var displayModeEntry: CharacteristicEntry? {
+        characteristics.first { $0.id.uuidString == "0010" }
+    }
+
+    /// Per-variant tunables — everything writable that isn't a generic
+    /// device control (name, display mode). Empty until the firmware
+    /// re-exposes mode-specific params.
+    public var variantParameters: [CharacteristicEntry] {
+        parameters.filter { !["0001", "0010"].contains($0.id.uuidString) }
     }
 
     /// Current display mode (0=Cat Eye, 1=Hypnotoad, 2=Sauron,

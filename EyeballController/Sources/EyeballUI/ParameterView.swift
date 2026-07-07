@@ -2,6 +2,37 @@ import SwiftUI
 import CoreBluetooth
 import EyeballBLE
 
+/// Vertical radio list of display modes — one Form row per mode. The
+/// caller provides context (e.g. a "Display Mode" section header).
+struct ModeListView: View {
+    @ObservedObject var entry: CharacteristicEntry
+    @ObservedObject var device: EyeballDevice
+    @EnvironmentObject var bluetooth: BluetoothManager
+
+    // Must match the firmware's display_mode_t order
+    static let modeNames = ["Cat Eye", "Hypnotoad", "Sauron", "Spiral Rings", "Heart"]
+
+    var body: some View {
+        let current = Int(entry.uint8Value ?? 0)
+        ForEach(Array(Self.modeNames.enumerated()), id: \.offset) { idx, name in
+            Button {
+                bluetooth.writeUInt8(UInt8(idx), to: entry, on: device)
+                entry.value = Data([UInt8(idx)])
+            } label: {
+                HStack {
+                    Image(systemName: idx == current
+                          ? "largecircle.fill.circle" : "circle")
+                        .foregroundStyle(idx == current ? Color.accentColor : .secondary)
+                    Text(name)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
 struct ParameterView: View {
     @ObservedObject var entry: CharacteristicEntry
     @ObservedObject var device: EyeballDevice
@@ -24,46 +55,22 @@ struct ParameterView: View {
 
     @ViewBuilder
     private var uint8Control: some View {
-        let modeNames = displayModeNames(for: entry)
-        if let names = modeNames {
-            // Enum-style picker: vertical list so all names stay readable
-            let current = Int(entry.uint8Value ?? 0)
-            VStack(alignment: .leading, spacing: 8) {
-                Text(entry.label)
-                ForEach(Array(names.enumerated()), id: \.offset) { idx, name in
-                    Button {
-                        bluetooth.writeUInt8(UInt8(idx), to: entry, on: device)
-                        entry.value = Data([UInt8(idx)])
-                    } label: {
-                        HStack {
-                            Image(systemName: idx == current
-                                  ? "largecircle.fill.circle" : "circle")
-                                .foregroundStyle(idx == current ? Color.accentColor : .secondary)
-                            Text(name)
-                            Spacer()
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
+        // Generic uint8 stepper (Display Mode gets its own ModeListView
+        // section in the dashboard rather than rendering here)
+        HStack {
+            Text(entry.label)
+            Spacer()
+            Text("\(entry.uint8Value ?? 0)")
+                .monospacedDigit()
+            Stepper("", value: Binding(
+                get: { Int(entry.uint8Value ?? 0) },
+                set: { newVal in
+                    let clamped = UInt8(clamping: newVal)
+                    bluetooth.writeUInt8(clamped, to: entry, on: device)
+                    entry.value = Data([clamped])
                 }
-            }
-        } else {
-            // Generic uint8 stepper
-            HStack {
-                Text(entry.label)
-                Spacer()
-                Text("\(entry.uint8Value ?? 0)")
-                    .monospacedDigit()
-                Stepper("", value: Binding(
-                    get: { Int(entry.uint8Value ?? 0) },
-                    set: { newVal in
-                        let clamped = UInt8(clamping: newVal)
-                        bluetooth.writeUInt8(clamped, to: entry, on: device)
-                        entry.value = Data([clamped])
-                    }
-                ), in: 0...255)
-                .labelsHidden()
-            }
+            ), in: 0...255)
+            .labelsHidden()
         }
     }
 
@@ -133,13 +140,6 @@ struct ParameterView: View {
             Spacer()
             Text(entry.value.map { String(format: "%02x", $0) }.joined())
                 .foregroundStyle(.secondary)
-        }
-    }
-
-    private func displayModeNames(for entry: CharacteristicEntry) -> [String]? {
-        switch entry.id.uuidString {
-        case "0010": return ["Cat Eye", "Hypnotoad", "Sauron", "Spiral Rings", "Heart"]
-        default: return nil
         }
     }
 

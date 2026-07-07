@@ -14,17 +14,73 @@ public class BluetoothManager: NSObject, ObservableObject {
 
     private var central: CBCentralManager!
     private var peripheralDelegates: [UUID: PeripheralDelegate] = [:]
+    private let registry = DeviceRegistry()
+    private var restoredKnownDevices = false
+    // Devices the user disconnected on purpose — don't auto-reconnect those
+    private var manualDisconnects: Set<UUID> = []
+
+    private var rssiTimer: Timer?
 
     public override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
+        // Poll RSSI on connected devices; advertisements cover the rest
+        rssiTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            for dev in self.devices where dev.isConnected {
+                dev.peripheral.readRSSI()
+            }
+        }
+    }
+
+    deinit {
+        rssiTimer?.invalidate()
+    }
+
+    /// Recreate device entries for registry members and issue pending
+    /// connects — CoreBluetooth completes them whenever the peripheral
+    /// comes into range, which is what gives us auto-reconnect on launch.
+    private func restoreKnownDevices() {
+        guard !restoredKnownDevices else { return }
+        restoredKnownDevices = true
+        let ids = registry.known.map { $0.id }
+        guard !ids.isEmpty else { return }
+        for peripheral in central.retrievePeripherals(withIdentifiers: ids) {
+            guard device(for: peripheral) == nil else { continue }
+            let dev = EyeballDevice(peripheral: peripheral)
+            if let saved = registry.known.first(where: { $0.id == peripheral.identifier }) {
+                dev.name = saved.name
+            }
+            dev.isKnown = true
+            devices.append(dev)
+            central.connect(peripheral, options: nil)
+        }
+    }
+
+    /// Drop a device from the persistent registry and the list.
+    public func forget(_ device: EyeballDevice) {
+        registry.remove(device.id)
+        manualDisconnects.remove(device.id)
+        central.cancelPeripheralConnection(device.peripheral)
+        device.isKnown = false
+        devices.removeAll { $0.id == device.id }
+    }
+
+    /// Registry bookkeeping when a device's name becomes known or changes.
+    fileprivate func noteName(_ name: String, for device: EyeballDevice) {
+        device.name = name
+        if device.isKnown {
+            registry.upsert(id: device.id, name: name)
+        }
     }
 
     public func startScanning() {
         guard central.state == .poweredOn else { return }
         isScanning = true
+        // Duplicates on: repeated advertisements keep RSSI live for
+        // devices we haven't connected to yet (foreground scanning only)
         central.scanForPeripherals(withServices: [eyeballServiceUUID],
-                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
     }
 
     public func stopScanning() {
@@ -33,11 +89,13 @@ public class BluetoothManager: NSObject, ObservableObject {
     }
 
     public func connect(_ device: EyeballDevice) {
+        manualDisconnects.remove(device.id)
         device.isConnecting = true
         central.connect(device.peripheral, options: nil)
     }
 
     public func disconnect(_ device: EyeballDevice) {
+        manualDisconnects.insert(device.id)   // deliberate — suppress auto-reconnect
         central.cancelPeripheralConnection(device.peripheral)
     }
 
@@ -61,7 +119,7 @@ public class BluetoothManager: NSObject, ObservableObject {
               let data = name.data(using: .utf8),
               data.count <= 20 else { return }
         write(data: data, to: entry, on: device)
-        device.name = name
+        noteName(name, for: device)
     }
 
     private func device(for peripheral: CBPeripheral) -> EyeballDevice? {
@@ -73,8 +131,9 @@ public class BluetoothManager: NSObject, ObservableObject {
 extension BluetoothManager: CBCentralManagerDelegate {
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
         bluetoothState = central.state
-        if central.state == .poweredOn && isScanning {
-            startScanning()
+        if central.state == .poweredOn {
+            restoreKnownDevices()
+            if isScanning { startScanning() }
         }
     }
 
@@ -82,11 +141,15 @@ extension BluetoothManager: CBCentralManagerDelegate {
                                didDiscover peripheral: CBPeripheral,
                                advertisementData: [String: Any],
                                rssi RSSI: NSNumber) {
-        guard device(for: peripheral) == nil else { return }
+        if let existing = device(for: peripheral) {
+            existing.updateRSSI(RSSI.intValue)
+            return
+        }
         let dev = EyeballDevice(peripheral: peripheral)
         if let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String {
             dev.name = name
         }
+        dev.updateRSSI(RSSI.intValue)
         devices.append(dev)
     }
 
@@ -95,6 +158,8 @@ extension BluetoothManager: CBCentralManagerDelegate {
         guard let dev = device(for: peripheral) else { return }
         dev.isConnecting = false
         dev.isConnected = true
+        dev.isKnown = true
+        registry.upsert(id: dev.id, name: dev.name)
 
         let delegate = PeripheralDelegate(device: dev, manager: self)
         peripheralDelegates[peripheral.identifier] = delegate
@@ -108,8 +173,15 @@ extension BluetoothManager: CBCentralManagerDelegate {
         guard let dev = device(for: peripheral) else { return }
         dev.isConnecting = false
         dev.isConnected = false
+        dev.rssi = nil
         dev.characteristics.removeAll()
         peripheralDelegates.removeValue(forKey: peripheral.identifier)
+
+        // Known device dropped without the user asking: issue a pending
+        // connect so it re-attaches as soon as it's back in range
+        if registry.contains(dev.id) && !manualDisconnects.contains(dev.id) {
+            central.connect(peripheral, options: nil)
+        }
     }
 }
 
@@ -121,6 +193,12 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
     init(device: EyeballDevice, manager: BluetoothManager) {
         self.device = device
         self.manager = manager
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        guard error == nil else { return }
+        let value = RSSI.intValue
+        DispatchQueue.main.async { self.device.updateRSSI(value) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -152,6 +230,13 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
                 device.characteristics.append(entry)
                 // Re-sort: device name first, then params, then stats
                 device.characteristics.sort { $0.id.uuidString < $1.id.uuidString }
+            }
+            // The name characteristic is authoritative — advertisement
+            // names can be stale
+            if characteristic.uuid == deviceNameCharUUID,
+               let data = characteristic.value,
+               let name = String(data: data, encoding: .utf8), !name.isEmpty {
+                manager?.noteName(name, for: device)
             }
         }
     }

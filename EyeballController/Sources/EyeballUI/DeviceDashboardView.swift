@@ -37,20 +37,48 @@ struct DeviceDashboardView: View {
                         }
                     }
                 }
+
+                HStack {
+                    Text("Signal")
+                    Spacer()
+                    SignalCirclesView(bars: device.signalBars)
+                    Text(device.rssi.map { "\($0) dBm" } ?? "—")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: IndicatorLayout.valueWidth, alignment: .trailing)
+                }
+
+                if let percent = batteryPercentEntry, let voltage = batteryVoltageEntry {
+                    BatteryRow(percent: percent, voltage: voltage)
+                }
             }
 
-            if !device.modeParameters.isEmpty {
-                Section("Parameters") {
-                    ForEach(device.modeParameters) { entry in
+            if let mode = device.displayModeEntry {
+                Section("Display Mode") {
+                    ModeListView(entry: mode, device: device)
+                        .environmentObject(bluetooth)
+                }
+            }
+
+            Section("Mode Options") {
+                if device.variantParameters.isEmpty {
+                    Text("No options for this mode")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(device.variantParameters) { entry in
                         ParameterView(entry: entry, device: device)
                             .environmentObject(bluetooth)
                     }
                 }
             }
 
-            if !device.stats.isEmpty {
+            // Stats other than battery (which lives in the Device section)
+            let extraStats = device.stats.filter {
+                !["0022", "0023"].contains($0.id.uuidString)
+            }
+            if !extraStats.isEmpty {
                 Section("Stats") {
-                    ForEach(device.stats) { entry in
+                    ForEach(extraStats) { entry in
                         StatView(entry: entry)
                     }
                 }
@@ -69,9 +97,17 @@ struct DeviceDashboardView: View {
         }
     }
 
+    private var batteryVoltageEntry: CharacteristicEntry? {
+        device.characteristics.first { $0.id.uuidString == "0022" }
+    }
+
+    private var batteryPercentEntry: CharacteristicEntry? {
+        device.characteristics.first { $0.id.uuidString == "0023" }
+    }
+
     private func logBattery() {
-        let voltage = device.characteristics.first { $0.id.uuidString == "0022" }?.floatValue ?? 0  // Battery V
-        let percent = device.characteristics.first { $0.id.uuidString == "0023" }?.floatValue ?? 0  // Battery %
+        let voltage = batteryVoltageEntry?.floatValue ?? 0
+        let percent = batteryPercentEntry?.floatValue ?? 0
         let ts = ISO8601DateFormatter().string(from: Date())
         print("\(ts) BAT: \(String(format: "%.2fV", voltage)) \(String(format: "%.0f%%", percent))")
     }
@@ -86,6 +122,24 @@ struct DeviceDashboardView: View {
         guard !trimmed.isEmpty else { return }
         bluetooth.writeDeviceName(trimmed, on: device)
         editingName = false
+    }
+}
+
+/// Battery percentage and voltage combined into one row.
+private struct BatteryRow: View {
+    @ObservedObject var percent: CharacteristicEntry
+    @ObservedObject var voltage: CharacteristicEntry
+
+    var body: some View {
+        HStack {
+            Text("Battery")
+            Spacer()
+            BatteryCirclesView(percent: Double(percent.floatValue ?? 0))
+            Text(voltage.floatValue.map { String(format: "%.2f V", $0) } ?? "—")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: IndicatorLayout.valueWidth, alignment: .trailing)
+        }
     }
 }
 

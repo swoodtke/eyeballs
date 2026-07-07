@@ -12,6 +12,14 @@ public struct DeviceListView: View {
             List(bluetooth.devices, selection: $selectedDevice) { device in
                 DeviceRow(device: device, bluetooth: bluetooth, selectedDevice: $selectedDevice)
                     .tag(device)
+                    .contextMenu {
+                        if device.isKnown {
+                            Button("Forget This Device", role: .destructive) {
+                                if selectedDevice == device { selectedDevice = nil }
+                                bluetooth.forget(device)
+                            }
+                        }
+                    }
             }
             .navigationTitle("Eyeballs")
             .navigationSplitViewColumnWidth(min: 220, ideal: 250)
@@ -58,7 +66,9 @@ private struct DeviceDetailView: View {
         } else {
             VStack(spacing: 12) {
                 Text(device.name).font(.title2)
-                Text("Not connected")
+                Text(device.isKnown
+                     ? "Not connected — will reconnect when in range"
+                     : "Not connected")
                     .foregroundStyle(.secondary)
                 Button("Connect") {
                     bluetooth.connect(device)
@@ -79,6 +89,7 @@ private struct DeviceRow: View {
                 .fill(device.isConnected ? .green : (device.isConnecting ? .orange : .gray))
                 .frame(width: 8, height: 8)
             Text(device.name)
+            SignalCirclesView(bars: device.signalBars)
             Spacer()
             Button(device.isConnected ? "Disconnect" : "Connect") {
                 if device.isConnected {
