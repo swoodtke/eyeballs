@@ -70,6 +70,12 @@ static uint16_t *framebuf[2];   // two full-screen buffers in PSRAM
 static uint16_t *draw_fb;       // points to whichever buffer the render task writes
 static int front_idx = 0;
 static int back_idx  = 1;
+
+// Dirty row band per framebuffer (inclusive), set by the render task and
+// consumed by lcd_flush: only rows that differ from the panel's GRAM get
+// sent. Modes that don't track dirtiness use the full screen.
+static volatile int flush_band_y0[2] = {0, 0};
+static volatile int flush_band_y1[2] = {INT32_MAX, INT32_MAX};
 static esp_lcd_panel_handle_t panel;
 
 // Dual-core synchronisation
@@ -404,7 +410,7 @@ static void lcd_init(void)
         // Chunk size for color transfers: small enough that 4 in-flight
         // bounce buffers fit in internal RAM, big enough to amortize the
         // per-chunk ISR overhead. Copy of chunk N+1 overlaps DMA of chunk N.
-        .max_transfer_sz = 30720,
+        .max_transfer_sz = 40960,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
@@ -680,6 +686,14 @@ static void lcd_flush(void)
 {
     const int W = board->lcd_w, H = board->lcd_h;
 
+    // Only the dirty row band needs to reach the panel — GRAM retains the
+    // rest from previous flushes
+    int y0 = flush_band_y0[front_idx];
+    int y1 = flush_band_y1[front_idx];
+    if (y0 < 0) y0 = 0;
+    if (y1 > H - 1) y1 = H - 1;
+    if (y1 < y0) return;   // nothing changed on the panel this frame
+
     // Start writing right after a TE (vsync) pulse so the GRAM write stays
     // behind the panel's scan-out instead of crossing it mid-frame
     if (board->pin_lcd_te >= 0) {
@@ -687,7 +701,7 @@ static void lcd_flush(void)
         xSemaphoreTake(te_sem, pdMS_TO_TICKS(25));  // wait for the next one
     }
 
-    esp_lcd_panel_draw_bitmap(panel, 0, 0, W, H, framebuf[front_idx]);
+    esp_lcd_panel_draw_bitmap(panel, 0, y0, W, y1 + 1, framebuf[front_idx] + y0 * W);
 
     // Block until the DMA has drained (callback fires on the last chunk):
     // this buffer becomes the render target next iteration, and Core 1
@@ -1553,15 +1567,23 @@ static uint32_t anim_comp_size = 0;
 static uint8_t *anim_frame_buf = NULL;    // one decoded frame (PSRAM)
 static int anim_frame_w, anim_frame_h, anim_num_frames;
 static int anim_frame_idx = 0;
-static int anim_frame_dir = 1;  // ping-pong direction
 static int anim_playback = 0;   // 0=ping-pong, 1=loop
+static int64_t anim_start_us = 0;
 static bool anim_inited = false;
+// Dirty-band bookkeeping: content row band last drawn into each framebuffer.
+// The first draw into each buffer paints the full screen (static border).
+static int anim_prev_band[2][2];
+static int anim_full_draws = 0;
 
-// Decode a 6-bit RLE bitstream into pixel buffer
-static void anim_decode_rle(const uint8_t *comp, int comp_size, uint8_t *out, int num_pixels)
+// Decode a 6-bit RLE bitstream into pixel buffer. Reports the first/last
+// pixel holding content (non-zero palette index) so callers can skip
+// unchanged background rows.
+static void anim_decode_rle(const uint8_t *comp, int comp_size, uint8_t *out, int num_pixels,
+                            int *min_px_out, int *max_px_out)
 {
     int bit_pos = 0;
     int px = 0;
+    int min_px = num_pixels, max_px = -1;
 
     #define READ6() ({ \
         int _byte = bit_pos >> 3; \
@@ -1573,6 +1595,8 @@ static void anim_decode_rle(const uint8_t *comp, int comp_size, uint8_t *out, in
     while (px < num_pixels) {
         int v = READ6();
         if (v != 0) {
+            if (px < min_px) min_px = px;
+            if (px > max_px) max_px = px;
             out[px++] = v;
         } else {
             int color = READ6();
@@ -1580,11 +1604,17 @@ static void anim_decode_rle(const uint8_t *comp, int comp_size, uint8_t *out, in
             if (count == 0) count = 1;
             int end = px + count;
             if (end > num_pixels) end = num_pixels;
+            if (color != 0) {
+                if (px < min_px) min_px = px;
+                if (end - 1 > max_px) max_px = end - 1;
+            }
             memset(out + px, color, end - px);
             px = end;
         }
     }
     #undef READ6
+    *min_px_out = min_px;
+    *max_px_out = max_px;
 }
 
 // Find animation in the eyedata partition TOC, return its offset and size
@@ -1682,7 +1712,8 @@ static void anim_init(const char *name)
     anim_offsets = offsets;
 
     anim_frame_idx = 0;
-    anim_frame_dir = 1;
+    anim_start_us = esp_timer_get_time();
+    anim_full_draws = 0;
     anim_inited = true;
     ESP_LOGI(TAG, "Anim '%s': %d×%d, %d frames, %.1f MB compressed in PSRAM",
              name, anim_frame_w, anim_frame_h, anim_num_frames,
@@ -1707,15 +1738,35 @@ static void eye_draw_anim(void)
     const int CX = board->eye_cx, CY = board->eye_cy;
     const int SR = board->sclera_r;
 
-    // Decode the current frame from the compressed data in PSRAM
+    // Wall-clock frame selection at the nominal 30 fps: display FPS only
+    // affects smoothness, never the animation's speed
+    int64_t pos = (esp_timer_get_time() - anim_start_us) * 30 / 1000000;
+    if (anim_playback == 1) {
+        anim_frame_idx = (int)(pos % anim_num_frames);
+    } else if (anim_num_frames > 1) {
+        int cycle = 2 * (anim_num_frames - 1);
+        int p = (int)(pos % cycle);
+        anim_frame_idx = p < anim_num_frames ? p : cycle - p;
+    } else {
+        anim_frame_idx = 0;
+    }
+
+    // Decode the current frame from the compressed data in PSRAM, learning
+    // which pixel range holds content (non-background)
     int frame_pixels = anim_frame_w * anim_frame_h;
     uint32_t comp_off = anim_offsets[anim_frame_idx];
     uint32_t comp_len = (anim_frame_idx + 1 < anim_num_frames
                          ? anim_offsets[anim_frame_idx + 1] : anim_comp_size) - comp_off;
-    anim_decode_rle(anim_comp_data + comp_off, comp_len, anim_frame_buf, frame_pixels);
+    int min_px, max_px;
+    anim_decode_rle(anim_comp_data + comp_off, comp_len, anim_frame_buf, frame_pixels,
+                    &min_px, &max_px);
     const uint8_t *frame = anim_frame_buf;
     uint16_t bg = anim_palette_rgb565[0];
-    uint16_t black = COL_BLACK;
+
+    // Palette entry expanded to the identical 2-pixel pair it becomes at 2x
+    uint32_t pal32[64];
+    for (int i = 0; i < 64; i++)
+        pal32[i] = (uint32_t)anim_palette_rgb565[i] * 0x00010001u;
 
     int scaled_w = anim_frame_w * 2;
     int scaled_h = anim_frame_h * 2;
@@ -1723,53 +1774,102 @@ static void eye_draw_anim(void)
     int oy = (H - scaled_h) / 2;
     int eye_r2 = SR * SR;
 
-    for (int y = 0; y < H; y++) {
-        int row = y * W;
+    // Screen-row band holding this frame's content
+    int cur_y0 = H, cur_y1 = -1;
+    if (max_px >= 0) {
+        cur_y0 = oy + (min_px / anim_frame_w) * 2;
+        cur_y1 = oy + (max_px / anim_frame_w) * 2 + 1;
+        if (cur_y0 < 0) cur_y0 = 0;
+        if (cur_y1 > H - 1) cur_y1 = H - 1;
+        if (cur_y1 < cur_y0) { cur_y0 = H; cur_y1 = -1; }
+    }
+
+    // Blit rows that differ from what THIS buffer still holds (frame N-2);
+    // flush rows that differ from what the PANEL shows (frame N-1). The
+    // first draw into each buffer paints everything, including the static
+    // black corners and background ring outside the animation frame.
+    // (Note: overlays drawn on top of the animation — the Sauron slit —
+    // rely on the fire content spanning the full frame every frame.)
+    int buf = (draw_fb == framebuf[1]) ? 1 : 0;
+    int blit_y0, blit_y1;
+    if (anim_full_draws < 2) {
+        blit_y0 = 0;  blit_y1 = H - 1;
+        flush_band_y0[buf] = 0;  flush_band_y1[buf] = H - 1;
+        anim_full_draws++;
+    } else {
+        blit_y0 = cur_y0 < anim_prev_band[buf][0] ? cur_y0 : anim_prev_band[buf][0];
+        blit_y1 = cur_y1 > anim_prev_band[buf][1] ? cur_y1 : anim_prev_band[buf][1];
+        flush_band_y0[buf] = cur_y0 < anim_prev_band[buf ^ 1][0] ? cur_y0 : anim_prev_band[buf ^ 1][0];
+        flush_band_y1[buf] = cur_y1 > anim_prev_band[buf ^ 1][1] ? cur_y1 : anim_prev_band[buf ^ 1][1];
+    }
+    anim_prev_band[buf][0] = cur_y0;
+    anim_prev_band[buf][1] = cur_y1;
+
+    int prev_fy = -1, prev_cx0 = 0, prev_cx1 = -1;
+    for (int y = blit_y0; y <= blit_y1; y++) {
+        uint16_t *out = draw_fb + y * W;
         int dy = y - CY;
         int dy2 = dy * dy;
-        int sy = y - oy;
-        int fy = sy >> 1;
-        int in_frame_y = (sy >= 0 && sy < scaled_h && fy < anim_frame_h);
-        const uint8_t *frame_row = in_frame_y ? frame + fy * anim_frame_w : NULL;
+        if (dy2 > eye_r2) {           // row entirely outside the eye circle
+            memset(out, 0, W * sizeof(uint16_t));   // COL_BLACK == 0x0000
+            prev_fy = -1;
+            continue;
+        }
 
         // Circle x-span for this row: one sqrt instead of a per-pixel test
-        int cx0 = W, cx1 = -1;
-        if (dy2 <= eye_r2) {
-            int half = (int)sqrtf((float)(eye_r2 - dy2));
-            cx0 = CX - half;     if (cx0 < 0) cx0 = 0;
-            cx1 = CX + half;     if (cx1 >= W) cx1 = W - 1;
+        int half = (int)sqrtf((float)(eye_r2 - dy2));
+        int cx0 = CX - half;  if (cx0 < 0) cx0 = 0;
+        int cx1 = CX + half;  if (cx1 >= W) cx1 = W - 1;
+
+        memset(out, 0, cx0 * sizeof(uint16_t));
+        memset(out + cx1 + 1, 0, (W - 1 - cx1) * sizeof(uint16_t));
+
+        int sy = y - oy;
+        int fy = sy >> 1;
+        if (sy < 0 || sy >= scaled_h || fy >= anim_frame_h) {
+            for (int x = cx0; x <= cx1; x++) out[x] = bg;
+            prev_fy = -1;
+            continue;
         }
 
-        for (int x = 0; x < cx0; x++)
-            draw_fb[row + x] = black;
+        // Identical sibling row (2x vertical scale): copy the row above
+        if (fy == prev_fy && cx0 == prev_cx0 && cx1 == prev_cx1) {
+            memcpy(out + cx0, out - W + cx0, (cx1 - cx0 + 1) * sizeof(uint16_t));
+            continue;
+        }
+        prev_fy = fy;  prev_cx0 = cx0;  prev_cx1 = cx1;
 
-        if (frame_row) {
-            for (int x = cx0; x <= cx1; x++) {
-                int sx = x - ox;
-                int fx = sx >> 1;
-                if (sx >= 0 && sx < scaled_w && fx < anim_frame_w)
-                    draw_fb[row + x] = anim_palette_rgb565[frame_row[fx]];
-                else
-                    draw_fb[row + x] = bg;
-            }
+        const uint8_t *frame_row = frame + fy * anim_frame_w;
+
+        // Circle regions left/right of the frame get the background colour
+        int xa = ox > cx0 ? ox : cx0;
+        int xb = ox + scaled_w - 1 < cx1 ? ox + scaled_w - 1 : cx1;
+        for (int x = cx0; x < xa; x++) out[x] = bg;
+        for (int x = xb + 1; x <= cx1; x++) out[x] = bg;
+
+        // Frame pixels: one aligned 32-bit store per output pixel pair
+        int x = xa;
+        if ((x & 1) && x <= xb) {                 // reach 4-byte alignment
+            out[x] = anim_palette_rgb565[frame_row[(x - ox) >> 1]];
+            x++;
+        }
+        if (((x - ox) & 1) == 0) {
+            // pair maps to one frame pixel doubled
+            for (; x + 1 <= xb; x += 2)
+                *(uint32_t *)(out + x) = pal32[frame_row[(x - ox) >> 1]];
         } else {
-            for (int x = cx0; x <= cx1; x++)
-                draw_fb[row + x] = bg;
+            // pair straddles two adjacent frame pixels
+            for (; x + 1 <= xb; x += 2) {
+                int fx = (x - ox) >> 1;
+                *(uint32_t *)(out + x) =
+                    (uint32_t)anim_palette_rgb565[frame_row[fx]] |
+                    ((uint32_t)anim_palette_rgb565[frame_row[fx + 1]] << 16);
+            }
         }
-
-        for (int x = cx1 + 1; x < W; x++)
-            draw_fb[row + x] = black;
+        if (x <= xb)
+            out[x] = anim_palette_rgb565[frame_row[(x - ox) >> 1]];
     }
 
-    if (anim_playback == 1) {
-        anim_frame_idx = (anim_frame_idx + 1) % anim_num_frames;
-    } else {
-        anim_frame_idx += anim_frame_dir;
-        if (anim_frame_idx >= anim_num_frames - 1)
-            anim_frame_dir = -1;
-        else if (anim_frame_idx <= 0)
-            anim_frame_dir = 1;
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1865,6 +1965,12 @@ static void eye_mode_switch(display_mode_t new_mode)
 
 static void eye_draw(void)
 {
+    // Default to flushing the whole frame; eye_draw_anim narrows this to
+    // the dirty row band when it can
+    int fb_idx = (draw_fb == framebuf[1]) ? 1 : 0;
+    flush_band_y0[fb_idx] = 0;
+    flush_band_y1[fb_idx] = board->lcd_h - 1;
+
     if (display_mode != active_mode) {
         // Clear screen — this frame gets flushed as black while resources load
         for (int i = 0; i < lcd_pixels; i++)
