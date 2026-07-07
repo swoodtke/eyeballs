@@ -7,3 +7,6 @@ output/
 __pycache__/
 .cache/
 EyeballController/build.log
+xcuserdata/
+*.xcuserstate
+EyeballController/.swiftpm/
