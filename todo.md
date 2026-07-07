@@ -3,17 +3,17 @@
 ## Code review findings (2026-07-02)
 
 ### Must fix
-- [ ] BLE Display Mode write crash — `main/main.c:2195` casts `ble_display_mode` to `display_mode_t` with no range check. A write ≥ 4 falls through both switches in `eye_mode_switch()`: `cat_eye_free()` runs (`iris_tex = NULL`) but nothing inits, and the next frame `eye_draw_cat()` dereferences NULL `iris_tex` (`main.c:1336`). Clamp like the touch handler does (`% NUM_MODES` at `main.c:2138`).
-- [ ] BLE Brightness param silently missing — `ble_params[]` has 26 entries but `MAX_PARAMS` is 24 (`main/ble.c:31`); `ble_init()` truncates, so BAT ADC Raw (0x0024) and Brightness (0x0025) never enter the GATT table. Raise `MAX_PARAMS` (also sizes `notify_handles`, `chr_defs`, `chr_uuids`) and add a `_Static_assert`/`ESP_LOGE` on overflow.
-- [ ] Stack overflow on malformed animation data — `main/main.c:1567–1577` reads `pal_size` from the eyedata partition header unchecked; `esp_partition_read` writes `pal_size * 3` bytes into a 192-byte stack buffer, then the copy loop overflows `anim_palette_rgb565[64]`. Reject `pal_size > 64`.
+- [x] BLE Display Mode write crash — fixed: `ble_display_mode` is clamped to `< NUM_MODES` before the cast (falls back to Cat Eye on an out-of-range write).
+- [x] BLE Brightness param silently missing — fixed: `MAX_PARAMS` raised to 40 and `ble_init()` logs an error instead of silently truncating.
+- [x] Stack overflow on malformed animation data — fixed: `anim_init()` rejects `pal_size` outside 1–64 before reading the palette.
 
 ### Should fix
-- [ ] 1.75" last flush strip exceeds `max_transfer_sz` — floor division at `main.c:383` and `main.c:658` gives 116-row strips but the last strip is 118 rows (110,024 bytes vs 108,112 limit). Use ceiling division in both places.
-- [ ] `mic_sensitivity` ≤ 1.0 breaks audio reactivity — `main.c:1017` divides by `(mic_sensitivity - 1.0f)`: div-by-zero at 1.0, negative below, drives `mic_loudness` negative/NaN. Clamp the value or the result.
-- [ ] PSRAM leak in `spiral_lut_init` — `main.c:1400`: if the 2nd/3rd alloc fails, earlier buffers leak; repeated mode switches compound it. Free non-NULL pointers on failure (as `anim_init` does).
-- [ ] Last animation frame decoded with wrong compressed size — `main.c:1613` falls back to uncompressed size for the last frame, so the RLE decoder reads garbage past the real data. Bound with the partition's `anim_size`.
-- [ ] Device rename silently fails on multi-byte characters — app truncates to 20 *characters* (`BluetoothManager.swift:62`) but the write guard checks 20 *UTF-8 bytes* (`DeviceDashboardView.swift:81`), so emoji/accented names silently revert. Enforce the limit in bytes.
-- [ ] `logBattery()` matches characteristics by label string (`DeviceDashboardView.swift:72`) — renaming "Battery V" in `labelForUUID` silently breaks logging. Match on UUID.
+- [x] 1.75" last flush strip exceeds `max_transfer_sz` — obsolete: strip-based flushing was replaced by a single draw_bitmap chunked by the SPI layer.
+- [x] `mic_sensitivity` ≤ 1.0 breaks audio reactivity — fixed: the divisor uses the sensitivity clamped to ≥ 1.05.
+- [x] PSRAM leak in `spiral_lut_init` — fixed: partial allocations are freed via `spiral_lut_free()` on failure.
+- [x] Last animation frame decoded with wrong compressed size — fixed by the decode-on-demand loader: the last frame is bounded by `anim_size` from the partition TOC.
+- [x] Device rename silently fails on multi-byte characters — fixed: `saveName()` trims whole characters until the name fits in 20 UTF-8 bytes.
+- [x] `logBattery()` matches characteristics by label string — fixed: matches on UUIDs 0022/0023/0024.
 
 ### Repo hygiene
 - [ ] `git rm -r mnt/` — `mnt/user-data/outputs/eyeball_1_46/main/CMakeLists.txt` is a stale duplicate of `main/CMakeLists.txt`
@@ -23,7 +23,7 @@
 - [ ] No BLE pairing/bonding — anyone in range can rename/control the device (and trigger the mode-write crash). Consider `BLE_GATT_CHR_F_WRITE_ENC` + bonding, or accept as a conscious choice.
 - [ ] `EyeballDevice.swift:29` uses `load(as: Float.self)` on `Data` — can trap on unaligned memory; use `loadUnaligned(as:)`.
 - [ ] BLE writes hit globals with no sync against the render loop — mostly cosmetic (one garbled color frame), but a BLE mode write can discard a simultaneous touch mode change.
-- [ ] Dead code: `draw_cat_pupil` (`main.c:1164`) never called; `te_sem` given from ISR but never taken; `CharacteristicEntry.dataLength` frozen at init and unused.
+- [ ] Dead code: `draw_cat_pupil` (`main.c:1164`) never called; `CharacteristicEntry.dataLength` frozen at init and unused. (`te_sem` is now consumed by the TE-synced flush.)
 - [ ] `EyeballDevice.swift:96` doc comment lists only 2 of 4 display modes.
 - [ ] `subscribeToCharacteristics()` rebuilds all Combine subscriptions on every characteristic append — O(N²) churn during discovery, harmless at N=26.
 - [ ] `board_config.h:26` unconditionally includes legacy `driver/i2c.h` even when the new I2C master API is in use — potential symbol conflicts.

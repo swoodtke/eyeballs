@@ -1056,7 +1056,10 @@ static float mic_read_loudness(void)
     float excess = mean_abs - mic_floor;
     float loudness_target = 0;
     if (excess > 0 && mic_floor > 0) {
-        loudness_target = excess / (mic_floor * (mic_sensitivity - 1.0f));
+        // BLE can set sensitivity to any value; at <= 1.0 the divisor goes
+        // zero/negative and loudness turns NaN/negative
+        float sens = mic_sensitivity > 1.05f ? mic_sensitivity : 1.05f;
+        loudness_target = excess / (mic_floor * (sens - 1.0f));
         if (loudness_target > 1.0f) loudness_target = 1.0f;
     }
 
@@ -1438,6 +1441,8 @@ static uint8_t  *spiral_mask      = NULL;  // 1 = inside circle, 0 = outside
 // is cyclic and the draw loop multiplies by an integer, so mod-2^16 survives.
 #define SPIRAL_DIST_SCALE 12288.0f
 
+static void spiral_lut_free(void);
+
 static void spiral_lut_init(void)
 {
     if (spiral_angle_lut) return;
@@ -1450,6 +1455,7 @@ static void spiral_lut_init(void)
     spiral_mask      = heap_caps_malloc(lcd_pixels, MALLOC_CAP_SPIRAM);
     if (!spiral_angle_lut || !spiral_dist_lut || !spiral_mask) {
         ESP_LOGE(TAG, "Spiral LUT alloc failed");
+        spiral_lut_free();   // don't leak the allocations that succeeded
         return;
     }
     float sr2 = SR * SR;

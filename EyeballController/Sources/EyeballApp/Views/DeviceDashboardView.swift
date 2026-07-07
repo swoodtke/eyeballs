@@ -70,15 +70,20 @@ struct DeviceDashboardView: View {
     }
 
     private func logBattery() {
-        let voltage = device.characteristics.first { $0.label == "Battery V" }?.floatValue ?? 0
-        let percent = device.characteristics.first { $0.label == "Battery %" }?.floatValue ?? 0
-        let raw = device.characteristics.first { $0.label == "BAT ADC Raw" }?.floatValue ?? 0
+        let voltage = device.characteristics.first { $0.id.uuidString == "0022" }?.floatValue ?? 0  // Battery V
+        let percent = device.characteristics.first { $0.id.uuidString == "0023" }?.floatValue ?? 0  // Battery %
+        let raw = device.characteristics.first { $0.id.uuidString == "0024" }?.floatValue ?? 0      // BAT ADC Raw
         let ts = ISO8601DateFormatter().string(from: Date())
         print("\(ts) BAT: \(String(format: "%.2fV", voltage)) \(String(format: "%.0f%%", percent)) raw=\(String(format: "%.0f", raw))")
     }
 
     private func saveName() {
-        let trimmed = String(newName.prefix(20))
+        // The device stores at most 20 UTF-8 bytes, not 20 characters —
+        // trim whole characters until the encoded name fits
+        var trimmed = newName
+        while trimmed.utf8.count > 20 && !trimmed.isEmpty {
+            trimmed.removeLast()
+        }
         guard !trimmed.isEmpty else { return }
         bluetooth.writeDeviceName(trimmed, on: device)
         editingName = false

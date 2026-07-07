@@ -28,7 +28,7 @@ static const ble_uuid128_t svc_uuid = BLE_UUID128_INIT(
 #define CHR_UUID_DEVICE_NAME  0x0001
 
 #define MAX_DEVICE_NAME  20
-#define MAX_PARAMS       24
+#define MAX_PARAMS       40
 #define NVS_NAMESPACE    "eyeball"
 #define NVS_KEY_NAME     "dev_name"
 
@@ -278,7 +278,13 @@ static void nimble_host_task(void *param)
 void ble_init(const ble_param_t *params, int count)
 {
     s_params = params;
-    s_param_count = count > MAX_PARAMS ? MAX_PARAMS : count;
+    if (count > MAX_PARAMS) {
+        ESP_LOGE(TAG, "ble_params[] has %d entries but MAX_PARAMS is %d — "
+                 "characteristics beyond the limit will NOT be registered! "
+                 "Raise MAX_PARAMS in ble.c.", count, MAX_PARAMS);
+        count = MAX_PARAMS;
+    }
+    s_param_count = count;
 
     // Init NVS
     esp_err_t ret = nvs_flash_init();
