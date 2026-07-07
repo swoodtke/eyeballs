@@ -71,30 +71,15 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
         characteristics.filter { $0.isWritable }
     }
 
-    private static let catEyeUUIDs: Set<String> = ["0011", "0012", "0013", "0014"]
-    private static let hypnotoadUUIDs: Set<String> = ["0015", "0016", "0017", "0018", "0019", "001A"]
-    private static let blobEyeUUIDs: Set<String> = ["001B", "001C", "001D", "001E"]
-    private static let globalUUIDs: Set<String> = ["0010", "0025", "0028", "002A"]  // Display Mode, Brightness, Mic Gain, Mic Sensitivity
-
-    /// Parameters for the current display mode + global params.
+    /// Writable parameters shown in the dashboard. The firmware exposes a
+    /// deliberately minimal set right now; when mode-specific params return,
+    /// per-mode filtering can come back with them.
     public var modeParameters: [CharacteristicEntry] {
-        let mode = displayMode
-        return parameters.filter { entry in
-            let uuid = entry.id.uuidString
-            if Self.globalUUIDs.contains(uuid) { return true }
-            if uuid == "0001" { return false }  // device name handled separately
-            switch mode {
-            case 0: return Self.catEyeUUIDs.contains(uuid)
-            case 1: return Self.hypnotoadUUIDs.contains(uuid)
-            case 2: return Self.blobEyeUUIDs.contains(uuid)
-            case 3: return Self.blobEyeUUIDs.contains(uuid)  // Sauron shares blob params
-            case 4, 5: return false  // Spiral Rings / Heart: pre-rendered, globals only
-            default: return true
-            }
-        }
+        parameters.filter { $0.id.uuidString != "0001" }  // name handled separately
     }
 
-    /// Current display mode (0=Cat Eye, 1=Hypnotoad).
+    /// Current display mode (0=Cat Eye, 1=Hypnotoad, 2=Sauron,
+    /// 3=Spiral Rings, 4=Heart).
     public var displayMode: UInt8 {
         characteristics.first { $0.id == CBUUID(string: "0010") }?.uint8Value ?? 0
     }

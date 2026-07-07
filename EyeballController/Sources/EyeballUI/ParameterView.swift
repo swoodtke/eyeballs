@@ -26,23 +26,26 @@ struct ParameterView: View {
     private var uint8Control: some View {
         let modeNames = displayModeNames(for: entry)
         if let names = modeNames {
-            // Enum-style picker
-            HStack {
+            // Enum-style picker: vertical list so all names stay readable
+            let current = Int(entry.uint8Value ?? 0)
+            VStack(alignment: .leading, spacing: 8) {
                 Text(entry.label)
-                Spacer()
-                Picker("", selection: Binding(
-                    get: { Int(entry.uint8Value ?? 0) },
-                    set: { newVal in
-                        bluetooth.writeUInt8(UInt8(newVal), to: entry, on: device)
-                        entry.value = Data([UInt8(newVal)])
+                ForEach(Array(names.enumerated()), id: \.offset) { idx, name in
+                    Button {
+                        bluetooth.writeUInt8(UInt8(idx), to: entry, on: device)
+                        entry.value = Data([UInt8(idx)])
+                    } label: {
+                        HStack {
+                            Image(systemName: idx == current
+                                  ? "largecircle.fill.circle" : "circle")
+                                .foregroundStyle(idx == current ? Color.accentColor : .secondary)
+                            Text(name)
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
                     }
-                )) {
-                    ForEach(Array(names.enumerated()), id: \.offset) { idx, name in
-                        Text(name).tag(idx)
-                    }
+                    .buttonStyle(.plain)
                 }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 200)
             }
         } else {
             // Generic uint8 stepper
@@ -135,24 +138,14 @@ struct ParameterView: View {
 
     private func displayModeNames(for entry: CharacteristicEntry) -> [String]? {
         switch entry.id.uuidString {
-        case "0010": return ["Cat Eye", "Hypnotoad", "Blob Eye", "Sauron", "Spiral Rings", "Heart"]
+        case "0010": return ["Cat Eye", "Hypnotoad", "Sauron", "Spiral Rings", "Heart"]
         default: return nil
         }
     }
 
     private func sliderRange(for entry: CharacteristicEntry) -> (Double, Double) {
+        // Add cases here as tunable params return to the firmware registry
         switch entry.id.uuidString {
-        case "0011": return (0.0, 1.0)      // Blink threshold
-        case "0012": return (1.0, 20.0)     // Close speed
-        case "0013": return (0.5, 10.0)     // Open speed
-        case "0014": return (0.01, 0.5)     // Hold time
-        case "0015": return (10.0, 20.0)     // Spiral zoom
-        case "0016": return (0.03, 0.12)     // Spiral speed
-        case "001B": return (0.2, 3.0)       // Blob speed
-        case "001E": return (0.0, 1.0)       // Blob pulse threshold
-        case "0025": return (0.0, 100.0)     // Brightness (0-100%)
-        case "0028": return (0.0, 14.0)     // Mic gain (ES7210: 0-14)
-        case "002A": return (1.5, 10.0)     // Mic sensitivity (floor multiplier)
         default: return (0.0, 100.0)
         }
     }

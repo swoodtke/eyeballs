@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 ## Project overview
-Animated eyeball display on a Waveshare ESP32-S3-Touch-LCD-1.46 (412x412 round AMOLED). Two eye modes: Cat Eye (realistic, IMU-tracked) and Hypnotoad (rotating log-spiral). A macOS SwiftUI app controls devices over BLE.
+Animated eyeball display on Waveshare round AMOLED boards (1.46" 412x412 and 1.75" 466x466). Five display modes: Cat Eye (realistic, IMU-tracked), Hypnotoad (rotating log-spiral), Sauron (fire + slit pupil), Spiral Rings, and Heart (the last three are pre-rendered animations from the eyedata flash partition). A SwiftUI app (macOS + iOS) controls devices over BLE.
 
 ## Repo structure
 - `main/` — ESP32 firmware (C, ESP-IDF)
@@ -31,12 +31,11 @@ cd EyeballController && swift build
 - **CoreBluetooth caches aggressively.** If new BLE characteristics don't appear after flashing, the user may need to toggle Bluetooth off/on in System Settings.
 
 ## BLE param system
-Parameters are registered in `main.c` as a `ble_param_t` array passed to `ble_init()`. Each param has a 16-bit UUID, flags (RW, RWN, or STAT), and a pointer to the actual variable. Adding a new param:
+Parameters are registered in `main.c` as a `ble_param_t` array passed to `ble_init()`. Each param has a 16-bit UUID, flags (RW, RWN, or STAT), and a pointer to the actual variable. The registry is deliberately minimal (Display Mode + battery stats) — internal tuning variables exist in firmware but are only exposed over BLE once proven useful. Adding a new param:
 1. Add the variable in `main.c`
 2. Add an entry to `ble_params[]` with a unique UUID
-3. Add the UUID to `labelForUUID()` in `BluetoothManager.swift`
-4. Add the UUID to the appropriate mode set in `EyeballDevice.swift` (catEyeUUIDs, hypnotoadUUIDs, or globalUUIDs)
-5. If it needs a custom slider range, add it to `sliderRange()` in `ParameterView.swift`
+3. Add the UUID to `labelForUUID()` in `BluetoothManager.swift` (in `Sources/EyeballBLE`)
+4. If it needs a custom slider range, add it to `sliderRange()` in `ParameterView.swift` (in `Sources/EyeballUI`)
 
 Flag types: `BLE_PARAM_RW` (read+write), `BLE_PARAM_RWN` (read+write+notify — use when device can change the value locally), `BLE_PARAM_STAT` (read+notify, for stats pushed to app).
 

@@ -23,7 +23,7 @@
 - [ ] No BLE pairing/bonding — anyone in range can rename/control the device (and trigger the mode-write crash). Consider `BLE_GATT_CHR_F_WRITE_ENC` + bonding, or accept as a conscious choice.
 - [ ] `EyeballDevice.swift:29` uses `load(as: Float.self)` on `Data` — can trap on unaligned memory; use `loadUnaligned(as:)`.
 - [ ] BLE writes hit globals with no sync against the render loop — mostly cosmetic (one garbled color frame), but a BLE mode write can discard a simultaneous touch mode change.
-- [ ] Dead code: `draw_cat_pupil` (`main.c:1164`) never called; `CharacteristicEntry.dataLength` frozen at init and unused. (`te_sem` is now consumed by the TE-synced flush.)
+- [ ] Dead code: `CharacteristicEntry.dataLength` frozen at init and unused. (`draw_cat_pupil` has been removed; `te_sem` is now consumed by the TE-synced flush.)
 - [ ] `EyeballDevice.swift:96` doc comment lists only 2 of 4 display modes.
 - [ ] `subscribeToCharacteristics()` rebuilds all Combine subscriptions on every characteristic append — O(N²) churn during discovery, harmless at N=26.
 - [ ] `board_config.h:26` unconditionally includes legacy `driver/i2c.h` even when the new I2C master API is in use — potential symbol conflicts.

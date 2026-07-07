@@ -17,8 +17,6 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # Optimisation
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
-# Allow esp_lcd to use DMA
-CONFIG_LCD_PANEL_IO_FORMAT_BUF_SIZE=512
 
 # Bluetooth — NimBLE (smaller footprint than Bluedroid)
 CONFIG_BT_ENABLED=y

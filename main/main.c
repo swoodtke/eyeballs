@@ -54,9 +54,9 @@ static int lcd_pixels;  // board->lcd_w * board->lcd_h, set once
 #define EXIO_TP_RST    (1 << 1)   // EXIO1
 #define EXIO_LCD_RST   (1 << 2)   // EXIO2
 
-typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_BLOB_EYE, MODE_SAURON,
+typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_SAURON,
                MODE_SPIRAL_RINGS, MODE_HEART } display_mode_t;
-#define NUM_MODES 6
+#define NUM_MODES 5
 static display_mode_t display_mode = MODE_CAT_EYE;
 static float current_fps = 0;
 static uint8_t display_brightness = 100;  // 0-100%, only used on CO5300 (1.75" board)
@@ -96,10 +96,7 @@ typedef struct {
     uint8_t spiral_color_b[3];
     uint8_t spiral_color_c[3];
     uint8_t spiral_color_d[3];
-    float blob_pulse;
     float sauron_blink_pos;
-    uint8_t blob_color_a[3];
-    uint8_t blob_color_b[3];
     uint16_t *target_fb;
 } render_params_t;
 
@@ -160,17 +157,6 @@ static void draw_circle(int cx, int cy, int r, uint16_t col)
     }
 }
 
-static void draw_hband(int y0, int y1, uint16_t col)
-{
-    const int W = board->lcd_w, H = board->lcd_h;
-    if (y0 < 0)   y0 = 0;
-    if (y1 >= H)   y1 = H - 1;
-    if (y0 > y1) return;
-    uint16_t *row = draw_fb + y0 * W;
-    for (int r = y0; r <= y1; r++, row += W)
-        for (int x = 0; x < W; x++)
-            row[x] = col;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // I2C helpers  (shared bus: TCA9554 + QMI8658 + touch + RTC)
@@ -377,8 +363,6 @@ static void lcd_init(void)
         gpio_set_level(board->pin_lcd_rst, 1);
         vTaskDelay(pdMS_TO_TICKS(120));
     }
-
-    int half_h = board->lcd_h / 2;
 
     // Create QSPI panel IO
     esp_lcd_panel_io_handle_t io_handle;
@@ -792,40 +776,6 @@ static void i2c_update_reg(uint8_t addr, uint8_t reg, uint8_t mask, uint8_t val)
     i2c_write_reg(addr, reg, (old & ~mask) | (val & mask));
 }
 
-static void es8311_init(void)
-{
-    // ES8311 is the DAC/speaker codec — we init it so I2S clocks work properly
-    i2c_write_reg(ES8311_ADDR, 0x00, 0x1F);   // Reset
-    vTaskDelay(pdMS_TO_TICKS(20));
-    i2c_write_reg(ES8311_ADDR, 0x00, 0x00);
-    i2c_write_reg(ES8311_ADDR, 0x00, 0x80);   // Power on
-
-    // Clock config: 16kHz, MCLK=4.096MHz from ESP32
-    i2c_write_reg(ES8311_ADDR, 0x01, 0x3F);   // All clocks on, MCLK from pin
-    i2c_write_reg(ES8311_ADDR, 0x02, 0x00);
-    i2c_write_reg(ES8311_ADDR, 0x03, 0x10);
-    i2c_write_reg(ES8311_ADDR, 0x04, 0x10);
-    i2c_write_reg(ES8311_ADDR, 0x05, 0x00);
-    i2c_write_reg(ES8311_ADDR, 0x06, 0x03);
-    i2c_write_reg(ES8311_ADDR, 0x07, 0x00);
-    i2c_write_reg(ES8311_ADDR, 0x08, 0xFF);
-
-    // Slave mode, 16-bit I2S
-    i2c_update_reg(ES8311_ADDR, 0x00, 0x40, 0x00);
-    i2c_write_reg(ES8311_ADDR, 0x09, 0x0C);   // SDP In: 16-bit
-    i2c_write_reg(ES8311_ADDR, 0x0A, 0x4C);   // SDP Out: 16-bit, ADC muted (bit 6) — ES7210 owns the data line
-
-    // Power up
-    i2c_write_reg(ES8311_ADDR, 0x0D, 0x01);
-    i2c_write_reg(ES8311_ADDR, 0x0E, 0x02);
-    i2c_write_reg(ES8311_ADDR, 0x12, 0x00);
-    i2c_write_reg(ES8311_ADDR, 0x13, 0x10);
-    i2c_write_reg(ES8311_ADDR, 0x1C, 0x6A);
-    i2c_write_reg(ES8311_ADDR, 0x37, 0x08);
-
-    ESP_LOGI(TAG, "ES8311 DAC initialized (I2S slave, 16kHz)");
-}
-
 static void es7210_init(void)
 {
     // Verify ES7210 is present
@@ -890,8 +840,9 @@ static void es7210_init(void)
 static void codec_init(void)
 {
     if (!board->has_codec) return;
-    // ES8311 disabled — not needed for mic, may conflict on shared I2S data line
-    // es8311_init();
+    // ES8311 (DAC/speaker) intentionally not initialized — not needed for
+    // mic input and it may conflict on the shared I2S data line. Speaker
+    // support is tracked in todo.md; the old init code is in git history.
     es7210_init();
 
     // Keep PA off — we only need mic input for now
@@ -1201,19 +1152,6 @@ static void eye_update(float ax, float ay, float az, float dt)
                  "pos=(%.1f,%.1f) | loud=%.3f",
                  now / 1000, dt * 1000.0f, ax, ay, az,
                  eye.px, eye.py, mic_loudness);
-    }
-}
-
-/** Draw a filled vertical slit (cat pupil) centred at (cx, cy).
- *  h = half-height, w = half-width at the widest point (middle). */
-static void draw_cat_pupil(int cx, int cy, int h, int w, uint16_t col)
-{
-    for (int dy = -h; dy <= h; dy++) {
-        // Elliptical profile: wider in the middle, pointed at top/bottom
-        float t = (float)dy / (float)h;          // -1..1
-        int half_w = (int)(w * sqrtf(1.0f - t * t));  // ellipse width
-        if (half_w < 1) half_w = 1;
-        hline(cx - half_w, cx + half_w, cy + dy, col);
     }
 }
 
@@ -1551,16 +1489,7 @@ static void eye_draw_hypnotoad(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Blob eye — pre-rendered animation playback
-// ─────────────────────────────────────────────────────────────────────────────
-static float blob_speed = 1.0f;
-static float blob_pulse_threshold = 0.7f;
-static float blob_pulse = 0;
-static uint8_t blob_color_a[3] = { 255, 120,   0 };  // tint color (unused for now)
-static uint8_t blob_color_b[3] = {  12,   2,   1 };  // background tint (unused for now)
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Generic pre-rendered animation loader (shared by blob eye, sauron, etc.)
+// Generic pre-rendered animation loader (shared by sauron, spiral, heart)
 // Reads from the "eyedata" flash partition which contains a TOC + multiple
 // animations packed by pack_eyedata.py.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1931,7 +1860,6 @@ static const char *mode_name(display_mode_t m) {
     switch (m) {
         case MODE_CAT_EYE:      return "CAT_EYE";
         case MODE_HYPNOTOAD:    return "HYPNOTOAD";
-        case MODE_BLOB_EYE:     return "BLOB_EYE";
         case MODE_SAURON:       return "SAURON";
         case MODE_SPIRAL_RINGS: return "SPIRAL_RINGS";
         case MODE_HEART:        return "HEART";
@@ -1949,7 +1877,6 @@ static void eye_mode_switch(display_mode_t new_mode)
     switch (active_mode) {
         case MODE_CAT_EYE:      cat_eye_free(); break;
         case MODE_HYPNOTOAD:    spiral_lut_free(); break;
-        case MODE_BLOB_EYE:
         case MODE_SAURON:
         case MODE_SPIRAL_RINGS:
         case MODE_HEART:        anim_free(); break;
@@ -1959,7 +1886,6 @@ static void eye_mode_switch(display_mode_t new_mode)
     switch (new_mode) {
         case MODE_CAT_EYE:      iris_tex_init(); sclera_lut_init(); break;
         case MODE_HYPNOTOAD:    spiral_lut_init(); break;
-        case MODE_BLOB_EYE:     anim_init("blob"); break;
         case MODE_SAURON:       anim_init("sauron"); break;
         case MODE_SPIRAL_RINGS: anim_init("spiral"); break;
         case MODE_HEART:        anim_init("heart"); break;
@@ -1993,8 +1919,7 @@ static void eye_draw(void)
         eye_draw_hypnotoad();
     else if (display_mode == MODE_SAURON)
         eye_draw_sauron();
-    else if (display_mode == MODE_BLOB_EYE ||
-             display_mode == MODE_SPIRAL_RINGS ||
+    else if (display_mode == MODE_SPIRAL_RINGS ||
              display_mode == MODE_HEART)
         eye_draw_anim();
     else
@@ -2024,9 +1949,6 @@ static void render_task(void *arg)
         memcpy(spiral_color_b, render_params.spiral_color_b, 3);
         memcpy(spiral_color_c, render_params.spiral_color_c, 3);
         memcpy(spiral_color_d, render_params.spiral_color_d, 3);
-        blob_pulse        = render_params.blob_pulse;
-        memcpy(blob_color_a, render_params.blob_color_a, 3);
-        memcpy(blob_color_b, render_params.blob_color_b, 3);
 
         eye_draw();
 
@@ -2253,33 +2175,13 @@ void app_main(void)
 
     // BLE param registry
     ble_display_mode = (uint8_t)display_mode;
+    // Deliberately minimal — params get re-added as they prove useful.
+    // The internal tuning variables (blink, spiral colors, mic gain, ...)
+    // still exist; they're just not exposed over BLE.
     static const ble_param_t ble_params[] = {
-        { 0x0010, "Display Mode",        BLE_PARAM_RWN,  &ble_display_mode,      1 },
-        { 0x0011, "Blink Threshold",     BLE_PARAM_RW,   &blink_loud_threshold,  4 },
-        { 0x0012, "Blink Close Speed",   BLE_PARAM_RW,   &blink_close_speed,     4 },
-        { 0x0013, "Blink Open Speed",    BLE_PARAM_RW,   &blink_open_speed,      4 },
-        { 0x0014, "Blink Hold Time",     BLE_PARAM_RW,   &blink_hold_time,       4 },
-        { 0x0015, "Spiral Zoom",        BLE_PARAM_RW,   &spiral_zoom,           4 },
-        { 0x0016, "Spiral Speed",       BLE_PARAM_RW,   &spiral_speed,          4 },
-        { 0x0017, "Spiral Color A",     BLE_PARAM_RW,   &spiral_color_a,        3 },
-        { 0x0018, "Spiral Color B",     BLE_PARAM_RW,   &spiral_color_b,        3 },
-        { 0x0019, "Spiral Color C",     BLE_PARAM_RW,   &spiral_color_c,        3 },
-        { 0x001A, "Spiral Color D",     BLE_PARAM_RW,   &spiral_color_d,        3 },
-        { 0x001B, "Blob Speed",        BLE_PARAM_RW,   &blob_speed,            4 },
-        { 0x001E, "Blob Pulse Thresh",BLE_PARAM_RW,   &blob_pulse_threshold,  4 },
-        { 0x001C, "Blob Color A",      BLE_PARAM_RW,   &blob_color_a,          3 },
-        { 0x001D, "Blob Color B",      BLE_PARAM_RW,   &blob_color_b,          3 },
-        { 0x0020, "Mic Loudness",        BLE_PARAM_STAT, &mic_loudness,          4 },
-        { 0x0026, "Mic Level",          BLE_PARAM_STAT, &mic_level,            4 },
-        { 0x0027, "Mic Floor",          BLE_PARAM_STAT, &mic_floor,            4 },
-        { 0x0028, "Mic Gain",          BLE_PARAM_RW,   &mic_gain,             1 },
-        { 0x0029, "Mic Peak",           BLE_PARAM_STAT, &mic_peak,             4 },
-        { 0x002A, "Mic Sensitivity",   BLE_PARAM_RW,   &mic_sensitivity,      4 },
-        { 0x0021, "FPS",                 BLE_PARAM_STAT, &current_fps,           4 },
-        { 0x0022, "Battery V",          BLE_PARAM_STAT, &battery_voltage,       4 },
-        { 0x0023, "Battery %",          BLE_PARAM_STAT, &battery_percent,       4 },
-        { 0x0024, "BAT ADC Raw",       BLE_PARAM_STAT, &bat_adc_raw,           4 },
-        { 0x0025, "Brightness",        BLE_PARAM_RW,   &display_brightness,    1 },
+        { 0x0010, "Display Mode",  BLE_PARAM_RWN,  &ble_display_mode,  1 },
+        { 0x0022, "Battery V",     BLE_PARAM_STAT, &battery_voltage,   4 },
+        { 0x0023, "Battery %",     BLE_PARAM_STAT, &battery_percent,   4 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
@@ -2295,10 +2197,7 @@ void app_main(void)
     memcpy(render_params.spiral_color_b, spiral_color_b, 3);
     memcpy(render_params.spiral_color_c, spiral_color_c, 3);
     memcpy(render_params.spiral_color_d, spiral_color_d, 3);
-    render_params.blob_pulse       = blob_pulse;
     render_params.sauron_blink_pos = sauron_blink_pos;
-    memcpy(render_params.blob_color_a, blob_color_a, 3);
-    memcpy(render_params.blob_color_b, blob_color_b, 3);
     xSemaphoreGive(flush_done_sem);
 
     int64_t prev_us = esp_timer_get_time();
@@ -2378,16 +2277,6 @@ void app_main(void)
             break;
         }
 
-        // Blob pulse — trigger on loud noise, decay quickly
-        if (mic_loudness > blob_pulse_threshold && blob_pulse < 0.1f) {
-            blob_pulse = 1.0f;
-            ESP_LOGI(TAG, "Blob pulse! loud=%.3f thresh=%.3f", mic_loudness, blob_pulse_threshold);
-        }
-        if (blob_pulse > 0) {
-            blob_pulse -= dt * 2.0f;  // decay over ~0.5s
-            if (blob_pulse < 0) blob_pulse = 0;
-        }
-
         if (ble_display_mode >= NUM_MODES) ble_display_mode = 0;
         display_mode = (display_mode_t)ble_display_mode;
 
@@ -2404,10 +2293,7 @@ void app_main(void)
         memcpy(render_params.spiral_color_b, spiral_color_b, 3);
         memcpy(render_params.spiral_color_c, spiral_color_c, 3);
         memcpy(render_params.spiral_color_d, spiral_color_d, 3);
-        render_params.blob_pulse       = blob_pulse;
         render_params.sauron_blink_pos = sauron_blink_pos;
-        memcpy(render_params.blob_color_a, blob_color_a, 3);
-        memcpy(render_params.blob_color_b, blob_color_b, 3);
         render_params.target_fb    = framebuf[back_idx];
 
         // Start Core 1 rendering into back buffer

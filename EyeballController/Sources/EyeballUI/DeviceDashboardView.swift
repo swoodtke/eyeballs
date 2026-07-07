@@ -72,9 +72,8 @@ struct DeviceDashboardView: View {
     private func logBattery() {
         let voltage = device.characteristics.first { $0.id.uuidString == "0022" }?.floatValue ?? 0  // Battery V
         let percent = device.characteristics.first { $0.id.uuidString == "0023" }?.floatValue ?? 0  // Battery %
-        let raw = device.characteristics.first { $0.id.uuidString == "0024" }?.floatValue ?? 0      // BAT ADC Raw
         let ts = ISO8601DateFormatter().string(from: Date())
-        print("\(ts) BAT: \(String(format: "%.2fV", voltage)) \(String(format: "%.0f%%", percent)) raw=\(String(format: "%.0f", raw))")
+        print("\(ts) BAT: \(String(format: "%.2fV", voltage)) \(String(format: "%.0f%%", percent))")
     }
 
     private func saveName() {
