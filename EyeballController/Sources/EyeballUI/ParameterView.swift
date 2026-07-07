@@ -99,10 +99,18 @@ struct ParameterView: View {
                 )
             },
             set: { newColor in
+                #if canImport(AppKit)
                 guard let components = NSColor(newColor).usingColorSpace(.sRGB) else { return }
-                let r = UInt8(clamping: Int(components.redComponent * 255))
-                let g = UInt8(clamping: Int(components.greenComponent * 255))
-                let b = UInt8(clamping: Int(components.blueComponent * 255))
+                let red = components.redComponent
+                let green = components.greenComponent
+                let blue = components.blueComponent
+                #else
+                var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+                UIColor(newColor).getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+                #endif
+                let r = UInt8(clamping: Int(red * 255))
+                let g = UInt8(clamping: Int(green * 255))
+                let b = UInt8(clamping: Int(blue * 255))
                 let data = Data([r, g, b])
                 bluetooth.write(data: data, to: entry, on: device)
                 entry.value = data

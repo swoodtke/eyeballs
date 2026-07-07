@@ -1,11 +1,13 @@
 import SwiftUI
 import EyeballBLE
 
-struct DeviceListView: View {
+public struct DeviceListView: View {
     @EnvironmentObject var bluetooth: BluetoothManager
     @State private var selectedDevice: EyeballDevice?
 
-    var body: some View {
+    public init() {}
+
+    public var body: some View {
         NavigationSplitView {
             List(bluetooth.devices, selection: $selectedDevice) { device in
                 DeviceRow(device: device, bluetooth: bluetooth, selectedDevice: $selectedDevice)

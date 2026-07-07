@@ -3,15 +3,17 @@ import PackageDescription
 
 let package = Package(
     name: "EyeballController",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v13), .iOS(.v16)],
     products: [
         .library(name: "EyeballBLE", targets: ["EyeballBLE"]),
+        .library(name: "EyeballUI", targets: ["EyeballUI"]),
     ],
     targets: [
         .target(name: "EyeballBLE"),
+        .target(name: "EyeballUI", dependencies: ["EyeballBLE"]),
         .executableTarget(
             name: "EyeballApp",
-            dependencies: ["EyeballBLE"],
+            dependencies: ["EyeballBLE", "EyeballUI"],
             exclude: ["Info.plist"]
         ),
     ]

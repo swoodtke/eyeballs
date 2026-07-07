@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import EyeballBLE
+import EyeballUI
 
 @main
 struct EyeballApp: App {
