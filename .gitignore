@@ -6,3 +6,4 @@ EyeballController/.build/
 output/
 __pycache__/
 .cache/
+EyeballController/build.log

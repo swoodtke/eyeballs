@@ -16,8 +16,8 @@
 - [x] `logBattery()` matches characteristics by label string — fixed: matches on UUIDs 0022/0023/0024.
 
 ### Repo hygiene
-- [ ] `git rm -r mnt/` — `mnt/user-data/outputs/eyeball_1_46/main/CMakeLists.txt` is a stale duplicate of `main/CMakeLists.txt`
-- [ ] `git rm EyeballController/build.log` and gitignore it — tracked build artifact
+- [x] `git rm -r mnt/` — removed
+- [x] `git rm EyeballController/build.log` and gitignore it — removed and ignored
 
 ### Minor
 - [ ] No BLE pairing/bonding — anyone in range can rename/control the device (and trigger the mode-write crash). Consider `BLE_GATT_CHR_F_WRITE_ENC` + bonding, or accept as a conscious choice.
