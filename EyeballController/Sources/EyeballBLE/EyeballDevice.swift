@@ -9,7 +9,6 @@ public class CharacteristicEntry: ObservableObject, Identifiable {
     public let label: String
     public let isWritable: Bool
     public let isNotifiable: Bool
-    public let dataLength: Int
 
     @Published public var value: Data
 
@@ -19,14 +18,14 @@ public class CharacteristicEntry: ObservableObject, Identifiable {
         self.label = label
         self.isWritable = characteristic.properties.contains(.write)
         self.isNotifiable = characteristic.properties.contains(.notify)
-        self.dataLength = characteristic.value?.count ?? 0
         self.value = characteristic.value ?? Data()
     }
 
     /// Interpret the value as a little-endian Float (4 bytes).
     public var floatValue: Float? {
         guard value.count == 4 else { return nil }
-        return value.withUnsafeBytes { $0.load(as: Float.self) }
+        // Data slices aren't guaranteed 4-byte aligned; load(as:) can trap
+        return value.withUnsafeBytes { $0.loadUnaligned(as: Float.self) }
     }
 
     /// Interpret the value as a single UInt8 (1 byte).

@@ -35,7 +35,16 @@ static const ble_uuid128_t svc_uuid = BLE_UUID128_INIT(
 static char device_name[MAX_DEVICE_NAME + 1];
 static const ble_param_t *s_params;
 static int s_param_count;
-static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+// Concurrent central connections (phone + Mac + spare) — a single slot let
+// any stranger's connection lock the owner out entirely
+#define MAX_CONNS 3
+static uint16_t s_conn_handles[MAX_CONNS] = {
+    BLE_HS_CONN_HANDLE_NONE, BLE_HS_CONN_HANDLE_NONE, BLE_HS_CONN_HANDLE_NONE
+};
+
+// Bond persistence (NimBLE NVS store) — implemented by the ESP port
+void ble_store_config_init(void);
 
 // Notification value handles — one per param
 static uint16_t notify_handles[MAX_PARAMS];
@@ -144,19 +153,24 @@ static void build_gatt_table(void)
     chr_defs[ci] = (struct ble_gatt_chr_def){
         .uuid       = &chr_uuids[ci].u,
         .access_cb  = device_name_access,
-        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        // Writes require an encrypted (bonded) link; reads stay open
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE |
+                      BLE_GATT_CHR_F_WRITE_ENC,
     };
     ci++;
 
     // Registered params
     for (int i = 0; i < s_param_count && ci < MAX_PARAMS + 1; i++, ci++) {
+        uint16_t flags = s_params[i].flags;
+        if (flags & BLE_PARAM_F_WRITE)
+            flags |= BLE_GATT_CHR_F_WRITE_ENC;
         chr_uuids[ci] = (ble_uuid16_t)BLE_UUID16_INIT(s_params[i].uuid16);
         chr_defs[ci] = (struct ble_gatt_chr_def){
             .uuid       = &chr_uuids[ci].u,
             .access_cb  = param_access,
             .arg        = (void *)(intptr_t)i,
             .val_handle = &notify_handles[i],
-            .flags      = s_params[i].flags,
+            .flags      = flags,
         };
     }
 
@@ -223,17 +237,26 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
-            s_conn_handle = event->connect.conn_handle;
-            ESP_LOGI(TAG, "Connected (handle=%d)", s_conn_handle);
+            for (int i = 0; i < MAX_CONNS; i++) {
+                if (s_conn_handles[i] == BLE_HS_CONN_HANDLE_NONE) {
+                    s_conn_handles[i] = event->connect.conn_handle;
+                    break;
+                }
+            }
+            ESP_LOGI(TAG, "Connected (handle=%d)", event->connect.conn_handle);
         } else {
             ESP_LOGW(TAG, "Connection failed: %d", event->connect.status);
-            start_advertising();
         }
+        // Keep advertising while connection slots remain
+        start_advertising();
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "Disconnected (reason=%d)", event->disconnect.reason);
-        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (s_conn_handles[i] == event->disconnect.conn.conn_handle)
+                s_conn_handles[i] = BLE_HS_CONN_HANDLE_NONE;
+        }
         start_advertising();
         break;
 
@@ -245,6 +268,21 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "Subscribe: attr_handle=%d, cur_notify=%d",
                  event->subscribe.attr_handle, event->subscribe.cur_notify);
         break;
+
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        ESP_LOGI(TAG, "Encryption %s (handle=%d status=%d)",
+                 event->enc_change.status == 0 ? "enabled" : "failed",
+                 event->enc_change.conn_handle, event->enc_change.status);
+        break;
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        // Peer lost its copy of the bond (re-flashed / forgot device) —
+        // drop ours so pairing can start fresh
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0)
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
 
     default:
         break;
@@ -305,6 +343,18 @@ void ble_init(const ble_param_t *params, int count)
     ble_hs_cfg.sync_cb  = ble_on_sync;
     ble_hs_cfg.reset_cb = ble_on_reset;
 
+    // Security: Just Works bonding with LE Secure Connections. Writable
+    // characteristics require an encrypted link (WRITE_ENC), so a central
+    // must pair before it can change anything; reads stay open. Bonds
+    // persist in NVS so reconnects re-encrypt without re-pairing.
+    ble_hs_cfg.sm_io_cap  = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_sc      = 1;
+    ble_hs_cfg.sm_our_key_dist   |= BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist |= BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_store_config_init();
+
     ble_svc_gap_init();
     ble_svc_gatt_init();
     // Set name AFTER gap_init, otherwise gap_init overwrites it with "nimble"
@@ -329,15 +379,17 @@ void ble_init(const ble_param_t *params, int count)
 
 void ble_notify_all(void)
 {
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    for (int c = 0; c < MAX_CONNS; c++) {
+        if (s_conn_handles[c] == BLE_HS_CONN_HANDLE_NONE) continue;
 
-    for (int i = 0; i < s_param_count; i++) {
-        if (!(s_params[i].flags & BLE_PARAM_F_NOTIFY)) continue;
-        if (notify_handles[i] == 0) continue;
+        for (int i = 0; i < s_param_count; i++) {
+            if (!(s_params[i].flags & BLE_PARAM_F_NOTIFY)) continue;
+            if (notify_handles[i] == 0) continue;
 
-        struct os_mbuf *om = ble_hs_mbuf_from_flat(s_params[i].data, s_params[i].data_len);
-        if (om) {
-            ble_gatts_notify_custom(s_conn_handle, notify_handles[i], om);
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(s_params[i].data, s_params[i].data_len);
+            if (om) {
+                ble_gatts_notify_custom(s_conn_handles[c], notify_handles[i], om);
+            }
         }
     }
 }

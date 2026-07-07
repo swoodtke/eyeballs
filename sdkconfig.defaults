@@ -21,4 +21,8 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # Bluetooth — NimBLE (smaller footprint than Bluedroid)
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# 3 slots so a stray connection can't lock the owner out (phone + Mac + spare)
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+# Persist bonds in NVS so paired centrals re-encrypt without re-pairing
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_MAX_BONDS=5
