@@ -1,13 +1,9 @@
 # TODO
 
 ## Open issues
-- [ ] 1.75" battery — no battery is physically attached yet. The AXP2101
-  driver has been fixed (correct VBAT registers, E-gauge percentage, button
-  power-on 512 ms / power-off 4 s hold in PMIC hardware), but it's untested
-  against a real battery: once one is wired, verify voltage/percent/charging
-  in the PWR log and that the button powers the board on from battery and
-  off with a 4 s hold. The init log's VBUS millivolt reading (~5000 on USB)
-  proves the ADC path works meanwhile.
+- [x] 1.75" battery — verified 2026-07-07 with a battery wired: AXP2101
+  voltage/percent readings are reasonable and the power button turns the
+  device on (512 ms press) and off (4 s hold) via PMIC hardware.
 - [ ] BLE writes hit globals with no sync against the render loop — mostly
   cosmetic, but a BLE mode write can discard a simultaneous touch mode change,
   and mode is the only writable param now. Cheap fix: apply BLE writes on the
