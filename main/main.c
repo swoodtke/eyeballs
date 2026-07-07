@@ -1966,24 +1966,34 @@ static float bat_adc_raw = 0;
 // ─────────────────────────────────────────────────────────────────────────────
 // AXP2101 PMIC (1.75" board) — battery monitoring + power control
 // ─────────────────────────────────────────────────────────────────────────────
+// Register map from the AXP2101 datasheet (X-power AXP2101 SWcharge V1.0)
 #define AXP2101_ADDR        0x34
 
-// ADC control
-#define AXP2101_ADC_CTRL    0x30   // ADC enable register
-#define AXP2101_ADC_VBAT_EN (1<<0) // Bit 0: enable VBAT ADC
-
-// Battery voltage: 14-bit, 1mV/LSB
-#define AXP2101_VBAT_H      0x78   // Bits [13:6]
-#define AXP2101_VBAT_L      0x79   // Bits [5:0]
-
-// Charge status
-#define AXP2101_STATUS1      0x00
-#define AXP2101_STATUS2      0x01
-
-// Power off
-#define AXP2101_PWROFF_EN    0x10  // Bit 0: power off
+#define AXP2101_STATUS1     0x00   // bit5: VBUS good, bit3: battery present
+#define AXP2101_STATUS2     0x01   // bits[6:5]: 00 standby, 01 charging, 10 discharging
+#define AXP2101_COMMON_CFG  0x10   // bit0: soft power off (write 1)
+#define AXP2101_PWROFF_EN   0x22   // bit1: PWRON long-press is a power-off source
+                                   // bit0: 0 = power off, 1 = restart on long-press
+#define AXP2101_LEVEL_CFG   0x27   // [5:4] IRQLEVEL, [3:2] OFFLEVEL (00=4s..11=10s),
+                                   // [1:0] ONLEVEL (00=128ms, 01=512ms, 10=1s, 11=2s)
+#define AXP2101_ADC_CTRL    0x30   // ADC channel enables: bit0 VBAT, bit2 VBUS, bit3 VSYS
+#define AXP2101_VBAT_H      0x34   // [5:0] = vbat[13:8]; read H before L
+#define AXP2101_VBAT_L      0x35   // vbat[7:0], 1 mV/LSB
+#define AXP2101_VBUS_H      0x38   // [5:0] = vbus[13:8]
+#define AXP2101_VBUS_L      0x39   // vbus[7:0], 1 mV/LSB
+#define AXP2101_BAT_PERCENT 0xA4   // E-gauge battery percentage, 0-100
 
 static bool pmic_available = false;
+static bool battery_present = false;
+static bool battery_charging = false;
+
+static uint16_t axp2101_read_adc14(uint8_t reg_h, uint8_t reg_l)
+{
+    uint8_t hi = 0, lo = 0;
+    i2c_read_reg(AXP2101_ADDR, reg_h, &hi, 1);   // datasheet: high 6 bits first
+    i2c_read_reg(AXP2101_ADDR, reg_l, &lo, 1);
+    return ((uint16_t)(hi & 0x3F) << 8) | lo;    // 1 mV/LSB
+}
 
 static void axp2101_init(void)
 {
@@ -1996,33 +2006,56 @@ static void axp2101_init(void)
         ESP_LOGW(TAG, "AXP2101 not found at 0x%02X", AXP2101_ADDR);
         return;
     }
+    battery_present = (val >> 3) & 1;
+    bool vbus_good  = (val >> 5) & 1;
 
-    // Enable VBAT ADC
+    // Enable VBAT, VBUS, and VSYS ADC channels
     i2c_read_reg(AXP2101_ADDR, AXP2101_ADC_CTRL, &val, 1);
-    val |= AXP2101_ADC_VBAT_EN;
+    val |= (1 << 0) | (1 << 2) | (1 << 3);
     i2c_write_reg(AXP2101_ADDR, AXP2101_ADC_CTRL, val);
 
+    // Power button behaviour to match the 1.46": short press (512 ms)
+    // powers on (handled by PMIC hardware from battery or USB), 4 s hold
+    // powers off. OFFLEVEL=00 (4s), ONLEVEL=01 (512ms), keep IRQLEVEL.
+    i2c_read_reg(AXP2101_ADDR, AXP2101_LEVEL_CFG, &val, 1);
+    val = (val & ~0x0F) | 0x01;
+    i2c_write_reg(AXP2101_ADDR, AXP2101_LEVEL_CFG, val);
+
+    // Make the long-press a power-off (not restart) source
+    i2c_read_reg(AXP2101_ADDR, AXP2101_PWROFF_EN, &val, 1);
+    val = (uint8_t)((val | 0x02) & ~0x01);
+    i2c_write_reg(AXP2101_ADDR, AXP2101_PWROFF_EN, val);
+
     pmic_available = true;
-    ESP_LOGI(TAG, "AXP2101 PMIC initialized (battery ADC enabled)");
+    ESP_LOGI(TAG, "AXP2101 PMIC initialized (battery %s, VBUS %s, VBUS=%umV)",
+             battery_present ? "present" : "absent",
+             vbus_good ? "good" : "absent",
+             axp2101_read_adc14(AXP2101_VBUS_H, AXP2101_VBUS_L));
 }
 
 static void axp2101_read_battery(void)
 {
     if (!pmic_available) return;
 
-    uint8_t hi = 0, lo = 0;
-    i2c_read_reg(AXP2101_ADDR, AXP2101_VBAT_H, &hi, 1);
-    i2c_read_reg(AXP2101_ADDR, AXP2101_VBAT_L, &lo, 1);
+    uint8_t status = 0;
+    i2c_read_reg(AXP2101_ADDR, AXP2101_STATUS1, &status, 1);
+    battery_present = (status >> 3) & 1;
+    if (!battery_present) {
+        battery_voltage = 0;
+        battery_percent = 0;
+        battery_charging = false;
+        return;
+    }
 
-    // 14-bit value: hi[7:0] = bits 13..6, lo[5:0] = bits 5..0
-    uint16_t raw = ((uint16_t)hi << 6) | (lo & 0x3F);
-    battery_voltage = raw / 1000.0f;  // 1mV per LSB → volts
+    i2c_read_reg(AXP2101_ADDR, AXP2101_STATUS2, &status, 1);
+    battery_charging = ((status >> 5) & 0x03) == 0x01;
 
-    // Li-ion approximate charge curve (3.3V=0%, 4.2V=100%)
-    float pct = (battery_voltage - 3.3f) / (4.2f - 3.3f) * 100.0f;
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    battery_percent = pct;
+    battery_voltage = axp2101_read_adc14(AXP2101_VBAT_H, AXP2101_VBAT_L) / 1000.0f;
+
+    // E-gauge fuel gauge reports calibrated percentage directly
+    uint8_t pct = 0;
+    i2c_read_reg(AXP2101_ADDR, AXP2101_BAT_PERCENT, &pct, 1);
+    battery_percent = pct > 100 ? 100 : pct;
 }
 
 static void axp2101_power_off(void)
@@ -2030,9 +2063,9 @@ static void axp2101_power_off(void)
     if (!pmic_available) return;
     ESP_LOGW(TAG, "AXP2101 power off!");
     uint8_t val = 0;
-    i2c_read_reg(AXP2101_ADDR, AXP2101_PWROFF_EN, &val, 1);
-    val |= 0x01;
-    i2c_write_reg(AXP2101_ADDR, AXP2101_PWROFF_EN, val);
+    i2c_read_reg(AXP2101_ADDR, AXP2101_COMMON_CFG, &val, 1);
+    val |= 0x01;   // soft PWROFF
+    i2c_write_reg(AXP2101_ADDR, AXP2101_COMMON_CFG, val);
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
@@ -2346,8 +2379,10 @@ void app_main(void)
 
             battery_read_voltage();
             if (board->has_pmic) {
-                ESP_LOGI(TAG, "PWR: PMIC BAT=%.2fV (%.0f%%)",
-                         battery_voltage, battery_percent);
+                ESP_LOGI(TAG, "PWR: PMIC BAT=%.2fV (%.0f%%) %s",
+                         battery_voltage, battery_percent,
+                         !battery_present ? "no battery"
+                         : battery_charging ? "charging" : "discharging");
             } else if (board->pin_bat_control >= 0) {
                 ESP_LOGI(TAG, "PWR: BAT_CTRL(IO%d)=%d KEY_BAT(IO%d)=%d BAT=%.2fV (raw=%.0f adc=%.3fV)",
                          board->pin_bat_control, gpio_get_level(board->pin_bat_control),
