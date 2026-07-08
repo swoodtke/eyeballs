@@ -377,6 +377,19 @@ void ble_init(const ble_param_t *params, int count)
     ESP_LOGI(TAG, "BLE initialized with %d params", s_param_count);
 }
 
+const char *ble_get_device_name(void)
+{
+    return device_name;
+}
+
+int ble_connected_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (s_conn_handles[i] != BLE_HS_CONN_HANDLE_NONE) n++;
+    return n;
+}
+
 void ble_notify_all(void)
 {
     for (int c = 0; c < MAX_CONNS; c++) {

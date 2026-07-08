@@ -22,3 +22,7 @@ typedef struct {
 
 void ble_init(const ble_param_t *params, int count);
 void ble_notify_all(void);
+
+// Status accessors (for the on-device status screen)
+const char *ble_get_device_name(void);
+int ble_connected_count(void);

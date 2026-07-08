@@ -38,6 +38,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "ble.h"
 #include "board_config.h"
+#include "font8x8_basic.h"
 
 static const char *TAG = "eye";
 
@@ -58,6 +59,9 @@ typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_SAURON,
                MODE_SPIRAL_RINGS, MODE_HEART } display_mode_t;
 #define NUM_MODES 5
 static display_mode_t display_mode = MODE_CAT_EYE;
+// Long-press status overlay (Core 0 owns; render sees it via render_params)
+static bool status_screen_on = false;
+static int64_t status_screen_since = 0;
 static float current_fps = 0;
 static uint8_t display_brightness = 100;  // 0-100%, only used on CO5300 (1.75" board)
 static uint8_t prev_brightness = 100;
@@ -97,6 +101,7 @@ typedef struct {
     uint8_t spiral_color_c[3];
     uint8_t spiral_color_d[3];
     float sauron_blink_pos;
+    bool status_screen;
     uint16_t *target_fb;
 } render_params_t;
 
@@ -445,7 +450,6 @@ static void lcd_init(void)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static uint8_t ble_display_mode = 0;
-static int64_t last_touch_us = 0;
 
 static SemaphoreHandle_t tp_sem;
 static volatile uint32_t tp_isr_count = 0;
@@ -559,14 +563,17 @@ static void touch_init(void)
     gpio_config(&tp_cfg);
     gpio_isr_handler_add(board->pin_tp_int, tp_isr, NULL);
 
-    ESP_LOGI(TAG, "Touch ready (tap to toggle mode, INT on GPIO%d)", board->pin_tp_int);
+    ESP_LOGI(TAG, "Touch ready (swipe=mode, long-press=status, INT on GPIO%d)",
+             board->pin_tp_int);
 }
 
 static uint32_t tp_serviced_count = 0;
 static uint32_t tp_spurious_count = 0;
 
-// ── SPD2010 touch check ──
-static bool touch_check_spd2010(void)
+// ── SPD2010 touch read ──
+// Point records start at byte 4 of the HDP data, 6 bytes each:
+// {id, x_lo, y_lo, xy_hi_nibbles, weight, ...} (esp_lcd_touch_spd2010 layout)
+static bool touch_read_spd2010(int *x, int *y)
 {
     uint8_t cmd[2] = {0x20, 0x00};
     uint8_t status[4] = {0};
@@ -575,59 +582,62 @@ static bool touch_check_spd2010(void)
     bool pt_exist = status[0] & 0x01;
     uint16_t read_len = (status[3] << 8) | status[2];
 
+    bool touched = false;
     if (pt_exist && read_len > 0) {
-        tp_serviced_count++;
         uint8_t hdr[2] = {0x00, 0x03};
         uint8_t data[64] = {0};
-        int rlen = read_len > sizeof(data) ? sizeof(data) : read_len;
+        int rlen = read_len > (int)sizeof(data) ? (int)sizeof(data) : read_len;
         tp_i2c_write_read(hdr, 2, data, rlen);
-
-        uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
-        tp_i2c_write(clr, 4);
-        return true;
-    } else {
-        tp_spurious_count++;
-        uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
-        tp_i2c_write(clr, 4);
-    }
-    return false;
-}
-
-// ── CST9217 touch check — minimal: any touch event = tap ──
-static bool touch_check_cst9217(void)
-{
-    // Read touch count from register 0x02 (standard HYN protocol)
-    uint8_t reg = 0x02;
-    uint8_t count = 0;
-    if (i2c_read_reg(board->tp_addr, reg, &count, 1) != ESP_OK) return false;
-    count &= 0x0F;
-    if (count > 0) {
-        tp_serviced_count++;
-        return true;
-    }
-    tp_spurious_count++;
-    return false;
-}
-
-/** Check touch — only reads I2C when TP_INT fires. */
-static bool touch_check(void)
-{
-    if (xSemaphoreTake(tp_sem, 0) != pdTRUE) return false;
-
-    bool touched;
-    if (board->use_spd2010)
-        touched = touch_check_spd2010();
-    else
-        touched = touch_check_cst9217();
-
-    if (touched) {
-        int64_t now = esp_timer_get_time();
-        if (now - last_touch_us > 1500000) {
-            last_touch_us = now;
-            return true;
+        if (rlen >= 10) {
+            *x = ((data[7] & 0xF0) << 4) | data[5];
+            *y = ((data[7] & 0x0F) << 8) | data[6];
+            touched = true;
+            tp_serviced_count++;
         }
     }
-    return false;
+    if (!touched) tp_spurious_count++;
+
+    uint8_t clr[] = {0x02, 0x00, 0x01, 0x00};
+    tp_i2c_write(clr, 4);
+    return touched;
+}
+
+// ── CST9217 touch read — native CST92xx report protocol ──
+// Read a frame at 16-bit register 0xD000, then write ACK 0xAB back.
+// Frame: [0]=id<<4|event, [1]=x_hi, [2]=y_hi, [3]=x_lo<<4|y_lo,
+// [5]&0x7F = point count, [6] must be 0xAB. Event 0x06 = contact.
+static bool touch_read_cst9217(int *x, int *y)
+{
+    uint8_t cmd[2] = {0xD0, 0x00};
+    uint8_t buf[15] = {0};
+    if (tp_i2c_write_read(cmd, 2, buf, sizeof(buf)) != ESP_OK) return false;
+
+    uint8_t ack[3] = {0xD0, 0x00, 0xAB};
+    tp_i2c_write(ack, 3);
+
+    if (buf[6] != 0xAB || buf[0] == 0xAB || buf[0] == 0x00) {
+        tp_spurious_count++;
+        return false;
+    }
+    int npoints = buf[5] & 0x7F;
+    int event   = buf[0] & 0x0F;
+    if (npoints == 0 || npoints > 2 || event != 0x06) {
+        tp_spurious_count++;
+        return false;
+    }
+    tp_serviced_count++;
+    *x = (buf[1] << 4) | (buf[3] >> 4);
+    *y = (buf[2] << 4) | (buf[3] & 0x0F);
+    return true;
+}
+
+/** Poll touch — only reads I2C when TP_INT fired. Returns true when a
+ *  touch sample with screen coordinates was captured. */
+static bool touch_poll(int *x, int *y)
+{
+    if (xSemaphoreTake(tp_sem, 0) != pdTRUE) return false;
+    return board->use_spd2010 ? touch_read_spd2010(x, y)
+                              : touch_read_cst9217(x, y);
 }
 
 // TE (tearing effect) sync — wait for display vsync before flushing
@@ -1867,6 +1877,8 @@ static const char *mode_name(display_mode_t m) {
     }
 }
 
+static void draw_status_screen(void);   // defined after the battery section
+
 static display_mode_t active_mode = MODE_CAT_EYE;
 
 static void eye_mode_switch(display_mode_t new_mode)
@@ -1909,6 +1921,11 @@ static void eye_draw(void)
             draw_fb[i] = COL_BLACK;
         eye_mode_switch(display_mode);
         return;  // show black frame; next call draws the new mode
+    }
+
+    if (render_params.status_screen) {
+        draw_status_screen();
+        return;
     }
 
     if (++mode_log_counter >= 200) {
@@ -2140,6 +2157,81 @@ static void battery_init(void)
     adc_oneshot_config_channel(bat_adc_handle, ADC_CHANNEL_7, &chan_cfg);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Status screen — long-press overlay with device info (font8x8, scaled)
+// ─────────────────────────────────────────────────────────────────────────────
+static void draw_char8(int x0, int y0, char c, int scale, uint16_t col)
+{
+    const int W = board->lcd_w, H = board->lcd_h;
+    if ((unsigned char)c > 0x7F) c = '?';
+    const unsigned char *glyph = font8x8_basic[(unsigned char)c];
+    for (int row = 0; row < 8; row++) {
+        uint8_t bits = glyph[row];   // bit 0 = leftmost pixel
+        if (!bits) continue;
+        for (int cb = 0; cb < 8; cb++) {
+            if (!((bits >> cb) & 1)) continue;
+            for (int sy = 0; sy < scale; sy++) {
+                int py = y0 + row * scale + sy;
+                if ((unsigned)py >= (unsigned)H) continue;
+                uint16_t *rowp = draw_fb + py * W;
+                for (int sx = 0; sx < scale; sx++) {
+                    int px = x0 + cb * scale + sx;
+                    if ((unsigned)px < (unsigned)W) rowp[px] = col;
+                }
+            }
+        }
+    }
+}
+
+static void draw_text_centered(int y, const char *s, int scale, uint16_t col)
+{
+    int len = (int)strlen(s);
+    int x = (board->lcd_w - len * 8 * scale) / 2;
+    for (int i = 0; i < len; i++, x += 8 * scale)
+        draw_char8(x, y, s[i], scale, col);
+}
+
+static void draw_status_screen(void)
+{
+    memset(draw_fb, 0, lcd_pixels * sizeof(uint16_t));   // black background
+
+    const uint16_t col_title = rgb(255, 255, 255);
+    const uint16_t col_label = rgb(120, 200, 255);
+    const uint16_t col_dim   = rgb(150, 150, 150);
+    char line[40];
+
+    const char *name = ble_get_device_name();
+    int name_scale = strlen(name) <= 14 ? 3 : 2;
+    int y = board->eye_cy - 110;
+
+    draw_text_centered(y, name, name_scale, col_title);
+    y += name_scale * 8 + 22;
+
+    draw_text_centered(y, mode_name(display_mode), 2, col_label);
+    y += 38;
+
+    if (battery_voltage > 0.5f) {
+        snprintf(line, sizeof(line), "BAT %d%% %.2fV%s",
+                 (int)battery_percent, battery_voltage,
+                 battery_charging ? " CHG" : "");
+    } else {
+        snprintf(line, sizeof(line), "BAT --");
+    }
+    draw_text_centered(y, line, 2, col_title);
+    y += 38;
+
+    int conns = ble_connected_count();
+    if (conns > 0)
+        snprintf(line, sizeof(line), "BLE %d LINK%s", conns, conns > 1 ? "S" : "");
+    else
+        snprintf(line, sizeof(line), "BLE ADVERTISING");
+    draw_text_centered(y, line, 2, col_title);
+    y += 38;
+
+    snprintf(line, sizeof(line), "FPS %.1f", current_fps);
+    draw_text_centered(y, line, 2, col_dim);
+}
+
 static void battery_read_voltage(void)
 {
     if (board->has_pmic) {
@@ -2231,6 +2323,7 @@ void app_main(void)
     memcpy(render_params.spiral_color_c, spiral_color_c, 3);
     memcpy(render_params.spiral_color_d, spiral_color_d, 3);
     render_params.sauron_blink_pos = sauron_blink_pos;
+    render_params.status_screen    = status_screen_on;
     xSemaphoreGive(flush_done_sem);
 
     int64_t prev_us = esp_timer_get_time();
@@ -2261,11 +2354,60 @@ void app_main(void)
         imu_accel(&ax, &ay, &az);
         mic_read_loudness();
 
-        if (touch_check()) {
-            display_mode = (display_mode_t)((display_mode + 1) % NUM_MODES);
-            ble_display_mode = (uint8_t)display_mode;
-            ESP_LOGI(TAG, "Touch! Switching to %s", mode_name(display_mode));
+        // ── Touch gestures ──
+        // Swipe left/right switches modes, long-press toggles the status
+        // screen; plain taps do nothing so accidental touches are harmless.
+        {
+            static bool g_active = false, g_consumed = false, g_moved = false;
+            static int g_x0, g_y0, g_x1, g_y1;
+            static int64_t g_t0 = 0, g_last = 0;
+
+            int tx, ty;
+            if (touch_poll(&tx, &ty)) {
+                if (!g_active) {
+                    g_active = true;  g_consumed = false;  g_moved = false;
+                    g_x0 = g_x1 = tx;  g_y0 = g_y1 = ty;  g_t0 = now_us;
+                }
+                g_x1 = tx;  g_y1 = ty;  g_last = now_us;
+                int mdx = g_x1 - g_x0, mdy = g_y1 - g_y0;
+                if (mdx < 0) mdx = -mdx;
+                if (mdy < 0) mdy = -mdy;
+                if (mdx > 20 || mdy > 20) g_moved = true;
+
+                // Long-press: finger held still for 800 ms
+                if (!g_consumed && !g_moved && now_us - g_t0 > 800000) {
+                    status_screen_on = !status_screen_on;
+                    status_screen_since = now_us;
+                    g_consumed = true;
+                    ESP_LOGI(TAG, "Long press: status screen %s",
+                             status_screen_on ? "on" : "off");
+                }
+            } else if (g_active && now_us - g_last > 150000) {
+                // No reports for 150 ms → finger lifted
+                g_active = false;
+                if (!g_consumed) {
+                    int dx = g_x1 - g_x0, dy = g_y1 - g_y0;
+                    int adx = dx < 0 ? -dx : dx;
+                    int ady = dy < 0 ? -dy : dy;
+                    if (adx >= board->lcd_w / 4 && adx > 2 * ady) {
+                        if (status_screen_on) {
+                            status_screen_on = false;   // swipe dismisses overlay
+                        } else {
+                            display_mode = (display_mode_t)((display_mode +
+                                (dx < 0 ? 1 : NUM_MODES - 1)) % NUM_MODES);
+                            ble_display_mode = (uint8_t)display_mode;
+                            ESP_LOGI(TAG, "Swipe %s: switching to %s",
+                                     dx < 0 ? "left" : "right",
+                                     mode_name(display_mode));
+                        }
+                    }
+                }
+            }
         }
+
+        // Status screen auto-dismiss after 10 s
+        if (status_screen_on && now_us - status_screen_since > 10000000)
+            status_screen_on = false;
 
         if (mic_loudness > blink_loud_threshold) {
             blink_trigger();
@@ -2327,6 +2469,7 @@ void app_main(void)
         memcpy(render_params.spiral_color_c, spiral_color_c, 3);
         memcpy(render_params.spiral_color_d, spiral_color_d, 3);
         render_params.sauron_blink_pos = sauron_blink_pos;
+        render_params.status_screen    = status_screen_on;
         render_params.target_fb    = framebuf[back_idx];
 
         // Start Core 1 rendering into back buffer

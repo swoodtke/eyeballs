@@ -11,7 +11,8 @@
 |---|---|
 | Tilt board | Pupil follows gravity |
 | Jump / tap desk | Eye blinks (mic-triggered) |
-| Touch display | Toggle between Cat Eye and Hypnotoad modes |
+| Swipe left/right | Switch display mode (next/previous) |
+| Long-press (0.8s) | Toggle on-device status screen (name, battery, BLE, FPS) |
 | Idle | Random saccade every 2–5 s |
 
 ### Eye modes
