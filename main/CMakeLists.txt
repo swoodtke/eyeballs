@@ -13,6 +13,7 @@ idf_component_register(
         nvs_flash
         esp_adc
         esp_partition
+        esp_app_format
 )
 
 target_link_libraries(${COMPONENT_LIB} INTERFACE m)

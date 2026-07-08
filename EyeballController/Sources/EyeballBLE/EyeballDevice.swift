@@ -34,9 +34,10 @@ public class CharacteristicEntry: ObservableObject, Identifiable {
         return value[0]
     }
 
-    /// Interpret the value as a UTF-8 string.
+    /// Interpret the value as a UTF-8 string (fixed-size characteristics
+    /// arrive NUL-padded, so decode up to the first NUL).
     public var stringValue: String? {
-        String(data: value, encoding: .utf8)
+        String(data: value.prefix(while: { $0 != 0 }), encoding: .utf8)
     }
 }
 
@@ -98,6 +99,11 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
     /// The Display Mode characteristic (generic device control).
     public var displayModeEntry: CharacteristicEntry? {
         characteristics.first { $0.id.uuidString == "0010" }
+    }
+
+    /// Firmware version string reported by the device (git describe).
+    public var firmwareVersion: String? {
+        characteristics.first { $0.id.uuidString == "0030" }?.stringValue
     }
 
     /// Per-variant tunables — everything writable that isn't a generic

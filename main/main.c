@@ -39,6 +39,7 @@
 #include "ble.h"
 #include "board_config.h"
 #include "font8x8_basic.h"
+#include "esp_app_desc.h"
 
 static const char *TAG = "eye";
 
@@ -63,6 +64,9 @@ static display_mode_t display_mode = MODE_CAT_EYE;
 static bool status_screen_on = false;
 static int64_t status_screen_since = 0;
 static float current_fps = 0;
+// Firmware version (git describe, stamped by the build) — shown on the
+// status screen and served over BLE so the app can spot stale devices
+static char fw_version[24];
 static uint8_t display_brightness = 100;  // 0-100%, only used on CO5300 (1.75" board)
 static uint8_t prev_brightness = 100;
 
@@ -2230,6 +2234,10 @@ static void draw_status_screen(void)
 
     snprintf(line, sizeof(line), "FPS %.1f", current_fps);
     draw_text_centered(y, line, 2, col_dim);
+    y += 38;
+
+    snprintf(line, sizeof(line), "FW %s", fw_version);
+    draw_text_centered(y, line, 2, col_dim);
 }
 
 static void battery_read_voltage(void)
@@ -2303,10 +2311,12 @@ void app_main(void)
     // Deliberately minimal — params get re-added as they prove useful.
     // The internal tuning variables (blink, spiral colors, mic gain, ...)
     // still exist; they're just not exposed over BLE.
+    strlcpy(fw_version, esp_app_get_description()->version, sizeof(fw_version));
     static const ble_param_t ble_params[] = {
         { 0x0010, "Display Mode",  BLE_PARAM_RWN,  &ble_display_mode,  1 },
         { 0x0022, "Battery V",     BLE_PARAM_STAT, &battery_voltage,   4 },
         { 0x0023, "Battery %",     BLE_PARAM_STAT, &battery_percent,   4 },
+        { 0x0030, "FW Version",    BLE_PARAM_F_READ, fw_version,      20 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 

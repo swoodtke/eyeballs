@@ -51,6 +51,16 @@ struct DeviceDashboardView: View {
                 if let percent = batteryPercentEntry, let voltage = batteryVoltageEntry {
                     BatteryRow(percent: percent, voltage: voltage)
                 }
+
+                if let fw = device.firmwareVersion, !fw.isEmpty {
+                    HStack {
+                        Text("Firmware")
+                        Spacer()
+                        Text(fw)
+                            .monospaced()
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             if let mode = device.displayModeEntry {
