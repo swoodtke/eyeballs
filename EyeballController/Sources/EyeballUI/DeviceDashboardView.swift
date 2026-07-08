@@ -107,14 +107,12 @@ struct DeviceDashboardView: View {
             }
 
             Section("Mode Options") {
-                if device.variantParameters.isEmpty {
+                if let mode = device.displayModeEntry {
+                    ModeOptionsList(device: device, modeEntry: mode)
+                        .environmentObject(bluetooth)
+                } else {
                     Text("No options for this mode")
                         .foregroundStyle(.secondary)
-                } else {
-                    ForEach(device.variantParameters) { entry in
-                        ParameterView(entry: entry, device: device)
-                            .environmentObject(bluetooth)
-                    }
                 }
             }
 
@@ -173,6 +171,28 @@ struct DeviceDashboardView: View {
 
 /// Display brightness slider (10-100% in steps of 10; the firmware
 /// refuses fully dark).
+/// Mode Options rows filtered to the currently selected display mode.
+/// Observes the mode characteristic so the list follows mode changes made
+/// in the app or by swiping on the device.
+private struct ModeOptionsList: View {
+    @ObservedObject var device: EyeballDevice
+    @ObservedObject var modeEntry: CharacteristicEntry
+    @EnvironmentObject var bluetooth: BluetoothManager
+
+    var body: some View {
+        let options = device.variantParameters(forMode: modeEntry.uint8Value ?? 0)
+        if options.isEmpty {
+            Text("No options for this mode")
+                .foregroundStyle(.secondary)
+        } else {
+            ForEach(options) { entry in
+                ParameterView(entry: entry, device: device)
+                    .environmentObject(bluetooth)
+            }
+        }
+    }
+}
+
 private struct BrightnessRow: View {
     @ObservedObject var entry: CharacteristicEntry
     @ObservedObject var device: EyeballDevice

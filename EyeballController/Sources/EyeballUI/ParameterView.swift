@@ -11,7 +11,7 @@ struct ModeListView: View {
 
     // Must match the firmware's display_mode_t order
     static let modeNames = ["Cat Eye", "Hypnotoad", "Sauron", "Spiral Rings",
-                            "Heart", "Clock"]
+                            "Heart", "Clock", "Glow", "Ball"]
 
     var body: some View {
         let current = Int(entry.uint8Value ?? 0)
@@ -43,6 +43,8 @@ struct ParameterView: View {
         // Device name is handled separately in the dashboard
         if entry.id == CBUUID(string: "0001") {
             EmptyView()
+        } else if entry.id == CBUUID(string: "0036") {
+            glowColorControl
         } else if entry.value.count == 1 {
             uint8Control
         } else if entry.value.count == 3 && entry.isWritable {
@@ -71,6 +73,33 @@ struct ParameterView: View {
                     entry.value = Data([clamped])
                 }
             ), in: 0...255)
+            .labelsHidden()
+        }
+    }
+
+    // Must match the firmware's glow_colors[] order
+    private static let glowColorNames = ["Yellow", "Red", "Blue", "Green"]
+
+    @ViewBuilder
+    private var glowColorControl: some View {
+        HStack {
+            Text(entry.label)
+            Spacer()
+            Picker("", selection: Binding(
+                get: { Int(entry.uint8Value ?? 0) },
+                set: { newVal in
+                    let v = UInt8(clamping: newVal)
+                    bluetooth.writeUInt8(v, to: entry, on: device)
+                    entry.value = Data([v])
+                }
+            )) {
+                ForEach(Array(Self.glowColorNames.enumerated()),
+                        id: \.offset) { idx, name in
+                    Text(name).tag(idx)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 280)
             .labelsHidden()
         }
     }

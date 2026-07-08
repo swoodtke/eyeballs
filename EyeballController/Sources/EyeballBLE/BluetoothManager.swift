@@ -275,6 +275,7 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         case "0033": return "Sync Role"
         case "0034": return "Clock"
         case "0035": return "Power Off"
+        case "0036": return "Glow Color"
         case "0040": return "Sync Data"
         default: return "Unknown (\(uuid.uuidString))"
         }

@@ -61,8 +61,9 @@ static int lcd_pixels;  // board->lcd_w * board->lcd_h, set once
 #define EXIO_LCD_RST   (1 << 2)   // EXIO2
 
 typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_SAURON,
-               MODE_SPIRAL_RINGS, MODE_HEART, MODE_CLOCK } display_mode_t;
-#define NUM_MODES 6
+               MODE_SPIRAL_RINGS, MODE_HEART, MODE_CLOCK,
+               MODE_GLOW, MODE_BALL } display_mode_t;   // append only: index persists in NVS
+#define NUM_MODES 8
 static display_mode_t display_mode = MODE_CAT_EYE;
 // Long-press status overlay (Core 0 owns; render sees it via render_params)
 static bool status_screen_on = false;
@@ -100,6 +101,7 @@ static uint8_t ble_power_off = 0;
 static uint32_t ble_clock = 0xFFFFFFFF;   // BLE-visible: local secs since midnight
 static uint8_t display_brightness = 100;  // 0-100%, persisted, set over BLE
 static uint8_t prev_brightness = 100;
+static uint8_t glow_color = 0;   // glow mode: 0=yellow 1=red 2=blue 3=green (BLE 0x0036)
 static esp_lcd_panel_io_handle_t lcd_io;  // kept for raw DCS commands (0x51)
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,6 +139,9 @@ typedef struct {
     uint8_t spiral_color_c[3];
     uint8_t spiral_color_d[3];
     float sauron_blink_pos;
+    uint8_t glow_color;
+    float ball_x, ball_y;   // ball mode: offset from eye center, pixels
+    float ball_flash;       // ball mode: 0-1 sudden-motion brightness pulse
     bool status_screen;
     uint8_t rotation;      // render-side rotation (all handled in the renderer)
     bool mirrored;         // right eye of a synced pair: counter-rotate visuals
@@ -837,6 +842,8 @@ static void settings_load(void)
             sync_role = v & 1;
         if (nvs_get_u8(h, "brightness", &v) == ESP_OK && v >= 10 && v <= 100)
             display_brightness = v;
+        if (nvs_get_u8(h, "glow_color", &v) == ESP_OK)
+            glow_color = v & 3;
         nvs_close(h);
     }
     ble_rotation = display_rotation;
@@ -1871,28 +1878,34 @@ static uint32_t anim_position_ms(void)
     return (uint32_t)((esp_timer_get_time() - anim_start_us) / 1000);
 }
 
-/** Align the animation clock to a peer's position. The measured drift
- *  includes BLE delivery plus up to a frame of poll latency (~50 ms of
- *  jitter at 20 fps), so corrections are slewed — at most 8 ms (a quarter
- *  frame, invisible) per beacon, 40 ms/s of authority at the 5 Hz beacon
- *  rate — rather than snapped; an outlier beacon must never step the
- *  animation visibly. Only a huge drift (fresh connect, mode change)
- *  snaps outright. (anim_start_us is read by the render core; a torn
- *  64-bit read would glitch a single frame at worst.) */
-static void anim_sync_clock(uint32_t pos_ms)
+/** Slew a wall-clock timebase toward a peer's reported position. The
+ *  measured drift includes BLE delivery plus up to a frame of poll latency
+ *  (~50 ms of jitter at 20 fps), so corrections are slewed — at most 8 ms
+ *  (a quarter frame, invisible) per beacon, 40 ms/s of authority at the
+ *  5 Hz beacon rate — rather than snapped; an outlier beacon must never
+ *  step the visuals visibly. Only a huge drift (fresh connect, mode
+ *  change) snaps outright. (The timebase is read by the render core; a
+ *  torn 64-bit read would glitch a single frame at worst.) */
+static void sync_clock_slew(int64_t *start_us, uint32_t pos_ms)
 {
-    if (!anim_inited) return;
     int64_t target = esp_timer_get_time() - (int64_t)pos_ms * 1000;
-    int64_t drift = target - anim_start_us;
+    int64_t drift = target - *start_us;
     if (drift > 400000 || drift < -400000) {
-        ESP_LOGW(TAG, "ANIM CLOCK SNAP %+lld ms", (long long)(drift / 1000));
-        anim_start_us = target;
+        ESP_LOGW(TAG, "SYNC CLOCK SNAP %+lld ms", (long long)(drift / 1000));
+        *start_us = target;
     } else if (drift > 20000 || drift < -20000) {
         int64_t step = drift / 4;
         if (step > 8000)  step = 8000;
         if (step < -8000) step = -8000;
-        anim_start_us += step;
+        *start_us += step;
     }
+}
+
+/** Align the animation clock to a peer's position. */
+static void anim_sync_clock(uint32_t pos_ms)
+{
+    if (!anim_inited) return;
+    sync_clock_slew(&anim_start_us, pos_ms);
 }
 
 static void anim_free(void)
@@ -2157,6 +2170,256 @@ static void eye_draw_sauron(void)
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Glow mode — a softly breathing ball of light in one of four selectable
+// colors. Static per-pixel intensity LUT + a per-frame 256-entry palette,
+// so the draw loop is a single byte lookup per pixel.
+// ─────────────────────────────────────────────────────────────────────────────
+static uint8_t *glow_lut = NULL;   // per-pixel distance², 0-255 over sclera_r² (PSRAM)
+static int64_t glow_start_us = 0;  // breath timebase; beacon-synced on a pair
+
+// The four selectable glow colors — bright and cheerful
+static const uint8_t glow_colors[4][3] = {
+    { 255, 210,   0 },   // yellow
+    { 255,  40,  40 },   // red
+    {  70, 140, 255 },   // blue
+    {  60, 255,  90 },   // green
+};
+
+/** Breath clock position in ms, beaconed to the paired eye in glow mode. */
+static uint32_t glow_position_ms(void)
+{
+    return (uint32_t)((esp_timer_get_time() - glow_start_us) / 1000);
+}
+
+/** Align the breath clock to the leader's position. */
+static void glow_sync_clock(uint32_t pos_ms)
+{
+    sync_clock_slew(&glow_start_us, pos_ms);
+}
+
+static void glow_lut_init(void)
+{
+    glow_start_us = esp_timer_get_time();   // restart the breath on entry
+    if (glow_lut) return;
+    const int W = board->lcd_w, H = board->lcd_h;
+    const int CX = board->eye_cx, CY = board->eye_cy;
+    const float sr2 = (float)board->sclera_r * (float)board->sclera_r;
+
+    glow_lut = heap_caps_malloc(lcd_pixels, MALLOC_CAP_SPIRAM);
+    if (!glow_lut) {
+        ESP_LOGE(TAG, "Glow LUT alloc failed");
+        return;
+    }
+    // The LUT stores geometry only (distance² as a fraction of sclera_r²);
+    // the falloff profile is evaluated in the per-frame palette so the orb
+    // radius can breathe without touching per-pixel work
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int i = y * W + x;
+            float dx = x - CX, dy = y - CY;
+            float d2 = (dx * dx + dy * dy) / sr2;
+            glow_lut[i] = d2 >= 1.0f ? 255 : (uint8_t)(d2 * 255.0f);
+        }
+    }
+    ESP_LOGI(TAG, "Glow LUT ready");
+}
+
+static void glow_lut_free(void)
+{
+    if (glow_lut) { heap_caps_free(glow_lut); glow_lut = NULL; }
+}
+
+static void eye_draw_glow(void)
+{
+    if (!glow_lut) return;
+
+    // Slow breathing pulse — wall-clock so the pace is FPS-independent.
+    // The timebase is beacon-synced across a pair, and the right eye
+    // offsets by half a cycle: one orb brightens as the other dims.
+    const int64_t period_us = 3500000;
+    int64_t el = esp_timer_get_time() - glow_start_us;
+    float ph = (float)(el % period_us) / (float)period_us;
+    if (render_params.mirrored) ph += 0.5f;
+    float sinval = sinf(ph * 2.0f * (float)M_PI);
+    float breath = 0.80f + 0.20f * sinval;
+    // The orb also swells with the breath: ~55% of the eye radius when dim,
+    // overshooting the eye circle at peak so the visibly bright core spans
+    // ≈ 90% of the screen (the LUT clamps beyond sclera_r, but out there
+    // the falloff is ~4% brightness — imperceptible)
+    float scale = 0.55f + 0.57f * (0.5f + 0.5f * sinval);
+    float inv_s2 = 1.0f / (scale * scale);
+
+    // Distance² → color ramp: falloff profile at the current radius, then
+    // black rim, selected color through the body, white-hot core. The
+    // breath scales the whole ramp, so the core also "cools" out of the
+    // white blend as it dims.
+    const uint8_t *base = glow_colors[render_params.glow_color & 3];
+    uint16_t pal[256];
+    for (int j = 0; j < 256; j++) {
+        float u2 = ((j + 0.5f) / 256.0f) * inv_s2;   // (d/R)² at this level
+        float t = 0;
+        if (u2 < 1.0f) {
+            float f = 1.0f - u2;        // 1 at center → 0 at the orb edge
+            t = f * f * breath;         // soften the falloff
+        }
+        float w = t > 0.72f ? (t - 0.72f) / (1.0f - 0.72f) : 0;
+        float r = (base[0] + (255.0f - base[0]) * w) * t;
+        float g = (base[1] + (255.0f - base[1]) * w) * t;
+        float b = (base[2] + (255.0f - base[2]) * w) * t;
+        pal[j] = rgb((uint8_t)r, (uint8_t)g, (uint8_t)b);
+    }
+
+    for (int i = 0; i < lcd_pixels; i++)
+        draw_fb[i] = pal[glow_lut[i]];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ball mode — a crisp glowing marble that rolls with device tilt, keeps
+// momentum, and bounces off the round screen edge. Physics on Core 0
+// (ball_update, from the same rotation-corrected gravity as the cat eye);
+// Core 1 draws from the position snapshot in render_params.
+// ─────────────────────────────────────────────────────────────────────────────
+static float ball_px = 0, ball_py = 0;   // offset from eye center, pixels
+static float ball_vx = 0, ball_vy = 0;   // velocity, pixels/s
+static float ball_flash = 0;             // 0-1 bright pulse, decays fast
+static float ball_prev_ax, ball_prev_ay, ball_prev_az;
+static bool  ball_accel_init = false;
+
+// Radial brightness profile indexed by d²/halo² (avoids a per-pixel sqrt):
+// solid body, steep edge, thin halo — crisp on purpose, unlike the glow orb
+static uint8_t ball_profile[256];
+static bool ball_profile_ready = false;
+
+static inline int ball_radius(void)  { return board->sclera_r * 3 / 10; }
+static inline int ball_halo(void)    { return ball_radius() * 3 / 2; }
+
+static void ball_init(void)
+{
+    ball_px = ball_py = ball_vx = ball_vy = 0;
+    ball_flash = 0;
+    ball_accel_init = false;
+    if (ball_profile_ready) return;
+    const float edge = 2.0f / 3.0f;          // ball edge as fraction of halo
+    for (int i = 0; i < 256; i++) {
+        float u = sqrtf((i + 0.5f) / 256.0f);   // normalized dist within halo
+        float v;
+        if (u < edge * 0.82f) {
+            // Body: gentle radial shading so only the very center reaches
+            // the palette's white zone — the rest stays saturated color
+            float t = u / (edge * 0.82f);
+            v = 1.0f - 0.16f * t * t;
+        } else if (u < edge) {
+            float t = (u - edge * 0.82f) / (edge * 0.18f);   // steep rim
+            v = 0.84f - t * 0.60f;
+        } else {
+            float t = (u - edge) / (1.0f - edge);            // thin halo
+            v = 0.25f * (1.0f - t) * (1.0f - t);
+        }
+        ball_profile[i] = (uint8_t)(v * 255.0f + 0.5f);
+    }
+    ball_profile_ready = true;
+}
+
+static void ball_update(float ax, float ay, float az, float dt)
+{
+    // Tilt → screen mapping matches the cat eye rattle (axes swapped)
+    const float gain = 2200.0f;        // strong reaction to tilt, px/s² per g
+    const float drag = 0.6f;           // light rolling drag, 1/s
+    ball_vx += ay * gain * dt;
+    ball_vy += ax * gain * dt;
+
+    // Sudden moves (a jump, a hard dance step) show up as a fast change in
+    // the accel vector: kick the ball with it and light the flash pulse
+    if (!ball_accel_init) {
+        ball_prev_ax = ax; ball_prev_ay = ay; ball_prev_az = az;
+        ball_accel_init = true;
+    }
+    float dax = ax - ball_prev_ax;
+    float day = ay - ball_prev_ay;
+    float daz = az - ball_prev_az;
+    ball_prev_ax = ax; ball_prev_ay = ay; ball_prev_az = az;
+    float jerk = sqrtf(dax * dax + day * day + daz * daz);
+    if (jerk > 0.5f) {                 // g of accel change per frame
+        const float kick = 900.0f;     // impulse, px/s per g of change
+        ball_vx += day * kick;
+        ball_vy += dax * kick;
+        float f = (jerk - 0.5f) / 1.5f;
+        if (f > 1.0f) f = 1.0f;
+        if (f > ball_flash) ball_flash = f;
+    }
+    ball_flash -= ball_flash * 5.0f * dt;   // ~quarter-second decay
+
+    ball_vx -= ball_vx * drag * dt;
+    ball_vy -= ball_vy * drag * dt;
+    ball_px += ball_vx * dt;
+    ball_py += ball_vy * dt;
+
+    // Bounce off the round screen edge; position clamp prevents tunneling
+    float limit = (float)(board->sclera_r - ball_radius());
+    float d = sqrtf(ball_px * ball_px + ball_py * ball_py);
+    if (d > limit && d > 0.1f) {
+        float nx = ball_px / d, ny = ball_py / d;
+        float vn = ball_vx * nx + ball_vy * ny;
+        if (vn > 0) {                  // moving outward: reflect off the rim
+            const float restitution = 0.72f;
+            ball_vx -= (1.0f + restitution) * vn * nx;
+            ball_vy -= (1.0f + restitution) * vn * ny;
+            // Hard wall hits flash too
+            float f = (vn - 700.0f) / 2000.0f;
+            if (f > 1.0f) f = 1.0f;
+            if (f > ball_flash) ball_flash = f;
+        }
+        ball_px = nx * limit;
+        ball_py = ny * limit;
+    }
+}
+
+static void eye_draw_ball(void)
+{
+    const int W = board->lcd_w, H = board->lcd_h;
+    const int bx = board->eye_cx + (int)render_params.ball_x;
+    const int by = board->eye_cy + (int)render_params.ball_y;
+    const int halo = ball_halo();
+    const int halo2 = halo * halo;
+
+    memset(draw_fb, 0, lcd_pixels * sizeof(uint16_t));   // COL_BLACK == 0x0000
+
+    // Color ramp: saturated color through the body, only a modest white
+    // highlight at the very center (the body tops out at ~0.84, below the
+    // white zone — full white would wash the color out to a fringe)
+    const uint8_t *base = glow_colors[render_params.glow_color & 3];
+    uint16_t pal[256];
+    float flash = render_params.ball_flash;
+    for (int j = 0; j < 256; j++) {
+        float t = j / 255.0f;
+        float w = t > 0.88f ? (t - 0.88f) / 0.12f * 0.7f : 0;
+        float r = (base[0] + (255.0f - base[0]) * w) * t;
+        float g = (base[1] + (255.0f - base[1]) * w) * t;
+        float b = (base[2] + (255.0f - base[2]) * w) * t;
+        // Sudden-motion pulse: blend the whole ball (halo included) to white
+        r += (255.0f - r) * flash * 0.6f;
+        g += (255.0f - g) * flash * 0.6f;
+        b += (255.0f - b) * flash * 0.6f;
+        pal[j] = rgb((uint8_t)r, (uint8_t)g, (uint8_t)b);
+    }
+
+    int y0 = by - halo;  if (y0 < 0) y0 = 0;
+    int y1 = by + halo;  if (y1 > H - 1) y1 = H - 1;
+    int x0 = bx - halo;  if (x0 < 0) x0 = 0;
+    int x1 = bx + halo;  if (x1 > W - 1) x1 = W - 1;
+    for (int y = y0; y <= y1; y++) {
+        uint16_t *out = draw_fb + y * W;
+        int dy2 = (y - by) * (y - by);
+        for (int x = x0; x <= x1; x++) {
+            int dx = x - bx;
+            int d2 = dx * dx + dy2;
+            if (d2 >= halo2) continue;
+            out[x] = pal[ball_profile[d2 * 256 / halo2]];
+        }
+    }
+}
+
 static int mode_log_counter = 0;
 static const char *mode_name(display_mode_t m) {
     switch (m) {
@@ -2166,6 +2429,8 @@ static const char *mode_name(display_mode_t m) {
         case MODE_SPIRAL_RINGS: return "SPIRAL_RINGS";
         case MODE_HEART:        return "HEART";
         case MODE_CLOCK:        return "CLOCK";
+        case MODE_GLOW:         return "GLOW";
+        case MODE_BALL:         return "BALL";
         default:             return "UNKNOWN";
     }
 }
@@ -2187,6 +2452,8 @@ static void eye_mode_switch(display_mode_t new_mode)
         case MODE_SPIRAL_RINGS:
         case MODE_HEART:        anim_free(); break;
         case MODE_CLOCK:        break;   // no resources
+        case MODE_GLOW:         glow_lut_free(); break;
+        case MODE_BALL:         break;   // profile LUT is static
     }
 
     // Init new mode resources
@@ -2197,6 +2464,8 @@ static void eye_mode_switch(display_mode_t new_mode)
         case MODE_SPIRAL_RINGS: anim_init("spiral"); break;
         case MODE_HEART:        anim_init("heart"); break;
         case MODE_CLOCK:        break;   // no resources
+        case MODE_GLOW:         glow_lut_init(); break;
+        case MODE_BALL:         ball_init(); break;
     }
 
     active_mode = new_mode;
@@ -2237,6 +2506,10 @@ static void eye_draw(void)
         eye_draw_anim();
     else if (display_mode == MODE_CLOCK)
         eye_draw_clock();
+    else if (display_mode == MODE_GLOW)
+        eye_draw_glow();
+    else if (display_mode == MODE_BALL)
+        eye_draw_ball();
     else
         eye_draw_cat();
 }
@@ -2734,6 +3007,7 @@ void app_main(void)
           eyesync_gatt_buf, EYESYNC_PKT_LEN },
         { 0x0034, "Clock",         BLE_PARAM_RW,   &ble_clock,         4 },
         { 0x0035, "Power Off",     BLE_PARAM_RW,   &ble_power_off,     1 },
+        { 0x0036, "Glow Color",    BLE_PARAM_RWN,  &glow_color,        1 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
@@ -2755,6 +3029,10 @@ void app_main(void)
     memcpy(render_params.spiral_color_c, spiral_color_c, 3);
     memcpy(render_params.spiral_color_d, spiral_color_d, 3);
     render_params.sauron_blink_pos = sauron_blink_pos;
+    render_params.glow_color       = glow_color;
+    render_params.ball_x           = ball_px;
+    render_params.ball_y           = ball_py;
+    render_params.ball_flash       = ball_flash;
     render_params.status_screen    = status_screen_on;
     render_params.rotation         = display_rotation;
     render_params.mirrored         = (sync_group != 0 && sync_role == 1);
@@ -2875,6 +3153,8 @@ void app_main(void)
         }
         blink_update(dt);
         eye_update(ax, ay, az, dt);
+        if (display_mode == MODE_BALL)
+            ball_update(ax, ay, az, dt);
 
         spiral_phase += spiral_speed;
         if (spiral_phase > 1.0f) spiral_phase -= 1.0f;
@@ -2943,8 +3223,12 @@ void app_main(void)
                 if (sblink)
                     // Organic pair blink: apply with 20-50 ms jitter
                     sync_blink_at_us = now_us + 20000 + (esp_random() % 30000);
-                if (spos != UINT32_MAX && (display_mode_t)spos_mode == display_mode)
-                    anim_sync_clock(spos);
+                if (spos != UINT32_MAX && (display_mode_t)spos_mode == display_mode) {
+                    if (display_mode == MODE_GLOW)
+                        glow_sync_clock(spos);
+                    else
+                        anim_sync_clock(spos);
+                }
             }
             if (sync_blink_at_us && now_us >= sync_blink_at_us) {
                 sync_blink_at_us = 0;
@@ -2966,8 +3250,10 @@ void app_main(void)
             }
         }
 
-        // Leader broadcasts mode + animation clock at 5 Hz
-        eyesync_beacon((uint8_t)display_mode, anim_position_ms());
+        // Leader broadcasts mode + animation/breath clock at 5 Hz
+        eyesync_beacon((uint8_t)display_mode,
+                       display_mode == MODE_GLOW ? glow_position_ms()
+                                                 : anim_position_ms());
 
         // Wall-clock set over BLE: rebase our reference and store to the RTC
         {
@@ -2998,6 +3284,10 @@ void app_main(void)
         memcpy(render_params.spiral_color_c, spiral_color_c, 3);
         memcpy(render_params.spiral_color_d, spiral_color_d, 3);
         render_params.sauron_blink_pos = sauron_blink_pos;
+        render_params.glow_color       = glow_color;
+        render_params.ball_x           = ball_px;
+        render_params.ball_y           = ball_py;
+        render_params.ball_flash       = ball_flash;
         render_params.status_screen    = status_screen_on;
         render_params.rotation         = display_rotation;
         render_params.mirrored         = (sync_group != 0 && sync_role == 1);
@@ -3010,6 +3300,17 @@ void app_main(void)
         if (display_brightness != prev_brightness) {
             display_apply_brightness();
             settings_save_u8("brightness", display_brightness);
+        }
+
+        // Persist glow color when changed via BLE
+        {
+            static int saved_glow = -1;
+            if (saved_glow < 0) {
+                saved_glow = glow_color;
+            } else if (saved_glow != (int)glow_color) {
+                saved_glow = glow_color;
+                settings_save_u8("glow_color", glow_color);
+            }
         }
 
         int64_t t1 = esp_timer_get_time();

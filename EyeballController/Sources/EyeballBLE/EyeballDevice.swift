@@ -129,18 +129,46 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
         characteristics.first { $0.id.uuidString == "0033" }
     }
 
+    /// Generic device controls (name, display mode, rotation, sync, …)
+    /// that never belong in the Mode Options section.
+    static let genericParameterUUIDs: Set<String> = [
+        "0001", "0010", "0025", "0031", "0032", "0033", "0034", "0035",
+        "0040",
+    ]
+
+    /// Mode-specific params: uuid → the display mode indices that use it.
+    /// Params absent from this map show in every mode.
+    static let parameterModes: [String: Set<UInt8>] = [
+        "0036": [6, 7],   // Glow Color → Glow, Ball
+    ]
+
+    /// Pure filter behind `variantParameters(forMode:)`, separated so the
+    /// selection logic is testable without a live peripheral.
+    public static func variantParameters(in entries: [CharacteristicEntry],
+                                         forMode mode: UInt8) -> [CharacteristicEntry] {
+        entries.filter {
+            guard $0.isWritable,
+                  !genericParameterUUIDs.contains($0.id.uuidString) else {
+                return false
+            }
+            return parameterModes[$0.id.uuidString].map { $0.contains(mode) } ?? true
+        }
+    }
+
     /// Per-variant tunables — everything writable that isn't a generic
     /// device control (name, display mode, rotation, sync). Empty until
     /// the firmware re-exposes mode-specific params.
     public var variantParameters: [CharacteristicEntry] {
-        parameters.filter {
-            !["0001", "0010", "0025", "0031", "0032", "0033", "0034", "0035",
-              "0040"].contains($0.id.uuidString)
-        }
+        parameters.filter { !Self.genericParameterUUIDs.contains($0.id.uuidString) }
+    }
+
+    /// The variant parameters relevant to the given display mode.
+    public func variantParameters(forMode mode: UInt8) -> [CharacteristicEntry] {
+        Self.variantParameters(in: characteristics, forMode: mode)
     }
 
     /// Current display mode (0=Cat Eye, 1=Hypnotoad, 2=Sauron,
-    /// 3=Spiral Rings, 4=Heart).
+    /// 3=Spiral Rings, 4=Heart, 5=Clock, 6=Glow).
     public var displayMode: UInt8 {
         characteristics.first { $0.id == CBUUID(string: "0010") }?.uint8Value ?? 0
     }

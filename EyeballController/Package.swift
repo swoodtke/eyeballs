@@ -16,5 +16,9 @@ let package = Package(
             dependencies: ["EyeballBLE", "EyeballUI"],
             exclude: ["Info.plist"]
         ),
+        .testTarget(
+            name: "EyeballControllerTests",
+            dependencies: ["EyeballBLE", "EyeballUI"]
+        ),
     ]
 )
