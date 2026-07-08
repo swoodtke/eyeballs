@@ -14,15 +14,18 @@
   QMI8658, ES7210, CST9217, and AXP2101.
 
 ## Eye-to-eye sync (goggle configuration)
-Two eyeballs must coordinate when worn as a pair. Chosen transport: **ESP-NOW**
-(WiFi peer-to-peer) — ~1–2 ms latency, works with no phone present, coexists
-with BLE, and consumes no BLE connection slots.
-- [ ] Pairing: a BLE param (persisted to NVS) assigns a group id + role
-  (left/right); leader = left eye
-- [ ] Leader broadcasts mode changes, the animation clock (anim start offset),
-  and blink/expression triggers; follower applies them
-- [ ] Blink timing: follower offsets blinks 20–50 ms for an organic feel
+Implemented over BLE dual-role (~1-3 mA vs ESP-NOW's always-listening WiFi at
+~60-90 mA). The left eye (role 0) is a central: it scans for a right eye
+advertising the same group id in manufacturer data, connects, bonds, and
+writes 8-byte packets to the Sync Data characteristic (0x0040); the right eye
+notifies its own events back on the same characteristic. BLE params
+0x0032/0x0033 set group + role (persisted; group 0 = off). Either eye can
+announce a mode change (last-writer-wins), the left beacons mode + animation
+clock at 5 Hz (peer snaps when drift > 50 ms), and blinks apply with a
+20–50 ms receiver jitter.
 - [ ] Later: mic beat-sync events ride the same channel
+- [ ] Later: hypnotoad spiral phase sync (only the pre-rendered animation
+  clock syncs today; hypnotoad advances per-frame)
 
 ## Features
 - [ ] Re-add BLE params as they prove useful — per-mode options land in the

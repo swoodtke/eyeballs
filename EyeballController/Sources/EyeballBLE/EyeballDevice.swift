@@ -111,11 +111,22 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
         characteristics.first { $0.id.uuidString == "0031" }
     }
 
+    /// Eye-sync group (0 = off) and role (0 = left/leader, 1 = right).
+    public var syncGroupEntry: CharacteristicEntry? {
+        characteristics.first { $0.id.uuidString == "0032" }
+    }
+    public var syncRoleEntry: CharacteristicEntry? {
+        characteristics.first { $0.id.uuidString == "0033" }
+    }
+
     /// Per-variant tunables — everything writable that isn't a generic
-    /// device control (name, display mode, rotation). Empty until the
-    /// firmware re-exposes mode-specific params.
+    /// device control (name, display mode, rotation, sync). Empty until
+    /// the firmware re-exposes mode-specific params.
     public var variantParameters: [CharacteristicEntry] {
-        parameters.filter { !["0001", "0010", "0031"].contains($0.id.uuidString) }
+        parameters.filter {
+            !["0001", "0010", "0031", "0032", "0033", "0040"]
+                .contains($0.id.uuidString)
+        }
     }
 
     /// Current display mode (0=Cat Eye, 1=Hypnotoad, 2=Sauron,

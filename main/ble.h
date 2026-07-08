@@ -26,3 +26,11 @@ void ble_notify_all(void);
 // Status accessors (for the on-device status screen)
 const char *ble_get_device_name(void);
 int ble_connected_count(void);
+
+// Notify one param immediately to all connected centrals (by 16-bit UUID)
+void ble_notify_param(uint16_t uuid16);
+
+// Include eye-sync group/role in advertising manufacturer data
+// ({0xFF,0xFF,'E',group,role}); group 0 omits the field. Restarts
+// advertising if it's running.
+void ble_set_sync_adv(uint8_t group, uint8_t role);

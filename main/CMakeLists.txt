@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "ble.c"
+    SRCS "main.c" "ble.c" "eyesync.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver

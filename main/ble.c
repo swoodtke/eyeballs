@@ -197,6 +197,12 @@ static void build_gatt_table(void)
 // ─────────────────────────────────────────────────────────────────────────────
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
 
+// Eye-sync group/role, embedded in advertising manufacturer data so a
+// left eye can find its partner without connecting
+static uint8_t s_sync_mfg[5] = { 0xFF, 0xFF, 'E', 0, 0 };
+static bool s_sync_adv_enabled = false;
+static bool s_host_synced = false;
+
 static void start_advertising(void)
 {
     // Ensure GAP name is current before every advertising start
@@ -216,6 +222,12 @@ static void start_advertising(void)
     fields.uuids128 = (ble_uuid128_t[]){ svc_uuid };
     fields.num_uuids128 = 1;
     fields.uuids128_is_complete = 1;
+
+    // Eye-sync pairing info (fills the 31-byte adv payload exactly)
+    if (s_sync_adv_enabled) {
+        fields.mfg_data = s_sync_mfg;
+        fields.mfg_data_len = sizeof(s_sync_mfg);
+    }
 
     ble_gap_adv_set_fields(&fields);
 
@@ -302,6 +314,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 static void ble_on_sync(void)
 {
     ESP_LOGI(TAG, "BLE host synced");
+    s_host_synced = true;
     if (s_svc_changed_pending) {
         // New firmware since last boot — tell bonded centrals to re-discover
         ble_svc_gatt_changed(0x0001, 0xffff);
@@ -408,6 +421,36 @@ void ble_init(const ble_param_t *params, int count)
 const char *ble_get_device_name(void)
 {
     return device_name;
+}
+
+void ble_set_sync_adv(uint8_t group, uint8_t role)
+{
+    s_sync_mfg[3] = group;
+    s_sync_mfg[4] = role;
+    s_sync_adv_enabled = (group != 0);
+    if (s_host_synced) {
+        // Restart advertising so the new manufacturer data takes effect
+        ble_gap_adv_stop();
+        start_advertising();
+    }
+    // Not synced yet: ble_on_sync's start_advertising picks the values up
+}
+
+void ble_notify_param(uint16_t uuid16)
+{
+    int idx = -1;
+    for (int i = 0; i < s_param_count; i++) {
+        if (s_params[i].uuid16 == uuid16) { idx = i; break; }
+    }
+    if (idx < 0 || notify_handles[idx] == 0) return;
+
+    for (int c = 0; c < MAX_CONNS; c++) {
+        if (s_conn_handles[c] == BLE_HS_CONN_HANDLE_NONE) continue;
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(s_params[idx].data,
+                                                   s_params[idx].data_len);
+        if (om)
+            ble_gatts_notify_custom(s_conn_handles[c], notify_handles[idx], om);
+    }
 }
 
 int ble_connected_count(void)

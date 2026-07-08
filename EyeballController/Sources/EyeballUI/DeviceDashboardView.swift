@@ -66,6 +66,16 @@ struct DeviceDashboardView: View {
                     RotationRow(entry: rotation, device: device)
                         .environmentObject(bluetooth)
                 }
+
+                if let group = device.syncGroupEntry {
+                    SyncGroupRow(entry: group, device: device)
+                        .environmentObject(bluetooth)
+                }
+                if let role = device.syncRoleEntry,
+                   (device.syncGroupEntry?.uint8Value ?? 0) != 0 {
+                    SyncRoleRow(entry: role, device: device)
+                        .environmentObject(bluetooth)
+                }
             }
 
             if let mode = device.displayModeEntry {
@@ -164,6 +174,58 @@ private struct RotationRow: View {
             }
             .pickerStyle(.segmented)
             .frame(maxWidth: 220)
+        }
+    }
+}
+
+/// Eye-sync group: 0 = off, matching non-zero values pair devices.
+private struct SyncGroupRow: View {
+    @ObservedObject var entry: CharacteristicEntry
+    @ObservedObject var device: EyeballDevice
+    @EnvironmentObject var bluetooth: BluetoothManager
+
+    var body: some View {
+        HStack {
+            Text("Sync Group")
+            Spacer()
+            Text(entry.uint8Value == 0 ? "Off" : "\(entry.uint8Value ?? 0)")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            Stepper("", value: Binding(
+                get: { Int(entry.uint8Value ?? 0) },
+                set: { newVal in
+                    let clamped = UInt8(clamping: newVal)
+                    bluetooth.writeUInt8(clamped, to: entry, on: device)
+                    entry.value = Data([clamped])
+                }
+            ), in: 0...9)
+            .labelsHidden()
+        }
+    }
+}
+
+/// Which side of the goggles this device is (left leads the sync clock).
+private struct SyncRoleRow: View {
+    @ObservedObject var entry: CharacteristicEntry
+    @ObservedObject var device: EyeballDevice
+    @EnvironmentObject var bluetooth: BluetoothManager
+
+    var body: some View {
+        HStack {
+            Text("Sync Role")
+            Spacer()
+            Picker("", selection: Binding(
+                get: { Int(entry.uint8Value ?? 0) },
+                set: { newVal in
+                    bluetooth.writeUInt8(UInt8(newVal), to: entry, on: device)
+                    entry.value = Data([UInt8(newVal)])
+                }
+            )) {
+                Text("Left").tag(0)
+                Text("Right").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 160)
         }
     }
 }

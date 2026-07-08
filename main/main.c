@@ -42,6 +42,7 @@
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "eyesync.h"
 
 static const char *TAG = "eye";
 
@@ -75,6 +76,10 @@ static char fw_version[24];
 // (swap_xy + mirror), persisted to NVS, settable over BLE.
 static uint8_t display_rotation = 0;
 static uint8_t ble_rotation = 0;
+
+// Eye-to-eye sync (ESP-NOW): group 0 = disabled, role 0 = left/leader
+static uint8_t sync_group = 0;
+static uint8_t sync_role = 0;
 static uint8_t display_brightness = 100;  // 0-100%, only used on CO5300 (1.75" board)
 static uint8_t prev_brightness = 100;
 
@@ -763,6 +768,10 @@ static void settings_load(void)
             display_rotation = v & 3;
         if (nvs_get_u8(h, "mode", &v) == ESP_OK && v < NUM_MODES)
             display_mode = (display_mode_t)v;
+        if (nvs_get_u8(h, "sync_group", &v) == ESP_OK)
+            sync_group = v;
+        if (nvs_get_u8(h, "sync_role", &v) == ESP_OK)
+            sync_role = v & 1;
         nvs_close(h);
     }
     ble_rotation = display_rotation;
@@ -1732,6 +1741,27 @@ static void anim_init(const char *name)
              anim_comp_size / (1024.0f * 1024.0f));
 }
 
+/** Animation clock position in ms for eye sync; UINT32_MAX when no
+ *  pre-rendered animation is active. */
+static uint32_t anim_position_ms(void)
+{
+    if (!anim_inited) return UINT32_MAX;
+    return (uint32_t)((esp_timer_get_time() - anim_start_us) / 1000);
+}
+
+/** Align the animation clock to a peer's position. Only snaps when the
+ *  drift exceeds 50 ms so beacon jitter doesn't cause visible stutter.
+ *  (anim_start_us is read by the render core; a torn 64-bit read would
+ *  glitch a single frame at worst.) */
+static void anim_sync_clock(uint32_t pos_ms)
+{
+    if (!anim_inited) return;
+    int64_t target = esp_timer_get_time() - (int64_t)pos_ms * 1000;
+    int64_t drift = target - anim_start_us;
+    if (drift > 50000 || drift < -50000)
+        anim_start_us = target;
+}
+
 static void anim_free(void)
 {
     if (anim_comp_data) { heap_caps_free(anim_comp_data); anim_comp_data = NULL; }
@@ -2447,8 +2477,15 @@ void app_main(void)
         { 0x0023, "Battery %",     BLE_PARAM_STAT, &battery_percent,   4 },
         { 0x0030, "FW Version",    BLE_PARAM_F_READ, fw_version,      20 },
         { 0x0031, "Rotation",      BLE_PARAM_RWN,  &ble_rotation,      1 },
+        { 0x0032, "Sync Group",    BLE_PARAM_RWN,  &sync_group,        1 },
+        { 0x0033, "Sync Role",     BLE_PARAM_RWN,  &sync_role,         1 },
+        { EYESYNC_CHR_UUID, "Sync Data", BLE_PARAM_RWN, eyesync_gatt_buf,
+          EYESYNC_PKT_LEN },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
+
+    // Eye-to-eye sync (starts WiFi/ESP-NOW only if a group is configured)
+    eyesync_set(sync_group, sync_role);
 
     // Launch render task on Core 1
     xTaskCreatePinnedToCore(render_task, "render", 8192, NULL, 5, NULL, 1);
@@ -2570,7 +2607,15 @@ void app_main(void)
             status_screen_on = false;
 
         if (mic_loudness > blink_loud_threshold) {
-            blink_trigger();
+            if (blink_trigger()) {
+                // Announce fresh blinks (not re-triggers) to the paired eye,
+                // rate-limited so sustained noise doesn't spam the radio
+                static int64_t last_blink_notify_us = 0;
+                if (now_us - last_blink_notify_us > 1000000) {
+                    last_blink_notify_us = now_us;
+                    eyesync_notify_blink((uint8_t)display_mode);
+                }
+            }
         }
         blink_update(dt);
         eye_update(ax, ay, az, dt);
@@ -2615,7 +2660,44 @@ void app_main(void)
         if (ble_display_mode >= NUM_MODES) ble_display_mode = 0;
         display_mode = (display_mode_t)ble_display_mode;
 
-        // Persist mode changes (swipe or BLE) so reboots resume where left
+        // ── Eye-to-eye sync ──
+        static int64_t sync_blink_at_us = 0;
+        bool mode_from_sync = false;
+        {
+            // Sync settings changed over BLE: persist and reconfigure
+            static int applied_group = -1, applied_role = -1;
+            if (applied_group != (int)sync_group || applied_role != (int)(sync_role & 1)) {
+                sync_role &= 1;
+                if (applied_group >= 0)  { // skip first pass (settings_load did it)
+                    settings_save_u8("sync_group", sync_group);
+                    settings_save_u8("sync_role", sync_role);
+                    eyesync_set(sync_group, sync_role);
+                }
+                applied_group = sync_group;
+                applied_role = sync_role;
+            }
+
+            int sm; bool sblink; uint32_t spos; uint8_t spos_mode;
+            if (eyesync_poll(&sm, &sblink, &spos, &spos_mode)) {
+                if (sm >= 0 && sm < NUM_MODES && (display_mode_t)sm != display_mode) {
+                    display_mode = (display_mode_t)sm;
+                    ble_display_mode = (uint8_t)sm;
+                    mode_from_sync = true;
+                }
+                if (sblink)
+                    // Organic pair blink: apply with 20-50 ms jitter
+                    sync_blink_at_us = now_us + 20000 + (esp_random() % 30000);
+                if (spos != UINT32_MAX && (display_mode_t)spos_mode == display_mode)
+                    anim_sync_clock(spos);
+            }
+            if (sync_blink_at_us && now_us >= sync_blink_at_us) {
+                sync_blink_at_us = 0;
+                blink_trigger();
+            }
+        }
+
+        // Persist mode changes (swipe or BLE) so reboots resume where left,
+        // and announce locally-originated changes to the paired eye
         {
             static int saved_mode = -1;
             if (saved_mode < 0) {
@@ -2623,8 +2705,13 @@ void app_main(void)
             } else if (saved_mode != (int)display_mode) {
                 saved_mode = (int)display_mode;
                 settings_save_u8("mode", (uint8_t)saved_mode);
+                if (!mode_from_sync)
+                    eyesync_notify_mode((uint8_t)saved_mode);
             }
         }
+
+        // Leader broadcasts mode + animation clock at 5 Hz
+        eyesync_beacon((uint8_t)display_mode, anim_position_ms());
 
         render_params.px           = eye.px;
         render_params.py           = eye.py;
