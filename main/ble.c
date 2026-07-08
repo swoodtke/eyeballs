@@ -47,10 +47,58 @@ static uint16_t s_conn_handles[MAX_CONNS] = {
 // Bond persistence (NimBLE NVS store) — implemented by the ESP port
 void ble_store_config_init(void);
 
-// Set when the firmware version differs from the last boot: bonded centrals
-// (iOS especially) cache our GATT table aggressively, so indicate Service
-// Changed to force them to re-discover the characteristics.
-static bool s_svc_changed_pending = false;
+// Per-peer GATT cache-bust: bonded centrals (iOS especially) cache our
+// GATT table aggressively, so each peer's NVS entry records the firmware
+// it last saw. When a peer's link encrypts with a stale record it gets a
+// Service Changed indication — regardless of how many boots ago the
+// firmware (and thus possibly the GATT table) changed. A single global
+// "first boot" flag proved insufficient: peers that reconnect only on a
+// later boot missed the window and kept stale handles.
+static uint32_t s_fw_hash = 0;
+
+static uint32_t fw_hash_compute(const char *s)
+{
+    uint32_t h = 2166136261u;   // FNV-1a
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+
+/** NVS key for a peer's last-seen-firmware record: "sc_" + 12 hex digits
+ *  of the identity address = 15 chars, exactly the NVS key limit. */
+static void peer_fw_key(const ble_addr_t *addr, char key[16])
+{
+    snprintf(key, 16, "sc_%02x%02x%02x%02x%02x%02x",
+             addr->val[5], addr->val[4], addr->val[3],
+             addr->val[2], addr->val[1], addr->val[0]);
+}
+
+static void peer_cache_bust(uint16_t conn_handle)
+{
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) return;
+
+    char key[16];
+    peer_fw_key(&desc.peer_id_addr, key);
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    uint32_t seen = 0;
+    esp_err_t err = nvs_get_u32(h, key, &seen);
+    if (err == ESP_OK && seen != s_fw_hash) {
+        // Peer last saw a different firmware: force a re-discovery.
+        // (Indicates on all subscribed connections — harmless for the
+        // up-to-date ones, they just re-discover an unchanged table.)
+        ble_svc_gatt_changed(0x0001, 0xffff);
+        ESP_LOGI(TAG, "Service Changed → %s (stale GATT cache)", key);
+    }
+    // Fresh bonds (no record yet) just get recorded: the peer is
+    // discovering the current table right now anyway
+    if (err != ESP_OK || seen != s_fw_hash) {
+        nvs_set_u32(h, key, s_fw_hash);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
 
 // Notification value handles — one per param
 static uint16_t notify_handles[MAX_PARAMS];
@@ -262,11 +310,6 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 }
             }
             ESP_LOGI(TAG, "Connected (handle=%d)", event->connect.conn_handle);
-            // First boot on new firmware: tell every client that connects
-            // to drop its cached GATT table — the boot-time indication only
-            // reaches peers that were already connected (i.e., nobody)
-            if (s_svc_changed_pending)
-                ble_svc_gatt_changed(0x0001, 0xffff);
         } else {
             ESP_LOGW(TAG, "Connection failed: %d", event->connect.status);
         }
@@ -296,7 +339,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "Encryption %s (handle=%d status=%d)",
                  event->enc_change.status == 0 ? "enabled" : "failed",
                  event->enc_change.conn_handle, event->enc_change.status);
-        if (event->enc_change.status != 0) {
+        if (event->enc_change.status == 0) {
+            // Bonded peers re-encrypt on every reconnect: the moment their
+            // identity is confirmed, bust a stale GATT cache if needed
+            peer_cache_bust(event->enc_change.conn_handle);
+        } else {
             // Stale bond (peer kept a key we no longer have, or vice
             // versa): drop our copy and start a fresh Just Works pairing
             // instead of letting the peer retry-and-fail forever
@@ -330,11 +377,6 @@ static void ble_on_sync(void)
 {
     ESP_LOGI(TAG, "BLE host synced");
     s_host_synced = true;
-    if (s_svc_changed_pending) {
-        // New firmware since last boot — tell bonded centrals to re-discover
-        ble_svc_gatt_changed(0x0001, 0xffff);
-        ESP_LOGI(TAG, "Indicated GATT Service Changed (new firmware)");
-    }
     start_advertising();
 }
 
@@ -372,22 +414,8 @@ void ble_init(const ble_param_t *params, int count)
 
     load_or_generate_name();
 
-    // Detect firmware changes across boots (GATT table may have changed)
-    {
-        nvs_handle_t h;
-        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-            const char *cur = esp_app_get_description()->version;
-            char last[32] = {0};
-            size_t len = sizeof(last);
-            nvs_get_str(h, "last_fw", last, &len);
-            if (strcmp(last, cur) != 0) {
-                s_svc_changed_pending = true;
-                nvs_set_str(h, "last_fw", cur);
-                nvs_commit(h);
-            }
-            nvs_close(h);
-        }
-    }
+    // Current firmware fingerprint for the per-peer cache-bust records
+    s_fw_hash = fw_hash_compute(esp_app_get_description()->version);
 
     // Init NimBLE
     ret = nimble_port_init();
