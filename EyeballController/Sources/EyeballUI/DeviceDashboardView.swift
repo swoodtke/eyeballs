@@ -339,6 +339,7 @@ private struct StatView: View {
         case "Battery %": return String(format: "%.0f%%", value)
         case "Battery V": return String(format: "%.2fV", value)
         case "FPS":         return String(format: "%.1f", value)
+        case "Noise Level", "Mic Gain": return String(format: "%.0f", value)
         case "BAT ADC Raw": return String(format: "%.0f", value)
         default:          return String(format: "%.2f", value)
         }

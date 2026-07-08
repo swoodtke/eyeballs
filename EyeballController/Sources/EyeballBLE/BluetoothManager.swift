@@ -269,6 +269,8 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         case "0022": return "Battery V"
         case "0023": return "Battery %"
         case "0025": return "Brightness"
+        case "0026": return "Noise Level"
+        case "0027": return "Mic Gain"
         case "0030": return "Firmware"
         case "0031": return "Rotation"
         case "0032": return "Sync Group"

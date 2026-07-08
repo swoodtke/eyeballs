@@ -1074,7 +1074,9 @@ static float mic_loudness = 0;        // smoothed loudness (0..1), drives pupil/
 static float mic_floor = 0;          // adaptive noise floor (slow-tracking average)
 static float mic_peak = 0;           // decaying peak above floor (for stats)
 static float mic_level = 0;          // current raw mean-abs level (for stats)
-static float mic_sensitivity = 3.0f; // floor multiplier for full loudness
+static float mic_ceiling = 0;        // adaptive "very loud" reference (auto-gain)
+static float ble_mic_level = 0;      // loudness 0-100 for the app (STAT)
+static float ble_mic_gain = 0;       // auto-gain 0-100 for the app (STAT)
                                       // loudness=1.0 when level = floor * sensitivity
 static uint8_t mic_gain = 0x0E;      // ES7210 PGA gain (0x00-0x0E)
 static uint8_t prev_mic_gain = 0x0E;
@@ -1208,16 +1210,25 @@ static float mic_read_loudness(void)
     else
         mic_peak = mic_peak * 0.995f + mean_abs * 0.005f;
 
-    // Loudness = how far above the noise floor, scaled by sensitivity
-    // At level == floor → loudness = 0
-    // At level == floor * sensitivity → loudness = 1.0
-    float excess = mean_abs - mic_floor;
+    // Automatic gain: the ceiling is the running "very loud" reference.
+    // A sound above it pulls it up fast (gain drops in loud places); it
+    // relaxes slowly toward ambient (~90 s) so quiet environments regain
+    // sensitivity on their own. Never below 3x the noise floor — silence
+    // must not crank the gain until breathing maxes the scale.
+    if (mean_abs > mic_ceiling)
+        mic_ceiling = mic_ceiling * 0.4f + mean_abs * 0.6f;
+    else
+        mic_ceiling = mic_ceiling * 0.9995f + mean_abs * 0.0005f;
+    float min_ceiling = mic_floor * 3.0f;
+    if (mic_ceiling < min_ceiling) mic_ceiling = min_ceiling;
+
+    // Loudness = where the level sits between the noise floor and the
+    // ceiling: 1.0 means "as loud as the loudest recent sound around here"
+    float span = mic_ceiling - mic_floor;
     float loudness_target = 0;
-    if (excess > 0 && mic_floor > 0) {
-        // BLE can set sensitivity to any value; at <= 1.0 the divisor goes
-        // zero/negative and loudness turns NaN/negative
-        float sens = mic_sensitivity > 1.05f ? mic_sensitivity : 1.05f;
-        loudness_target = excess / (mic_floor * (sens - 1.0f));
+    if (span > 1.0f) {
+        loudness_target = (mean_abs - mic_floor) / span;
+        if (loudness_target < 0) loudness_target = 0;
         if (loudness_target > 1.0f) loudness_target = 1.0f;
     }
 
@@ -1255,7 +1266,7 @@ static EyeState eye;
 // Eyelid position: 0.0 = fully open, 1.0 = fully closed
 static float blink_pos = 0;
 // Blink trigger threshold (configurable — will be used for mic, photoresistor, etc.)
-static float blink_loud_threshold = 0.7f;   // mic loudness that triggers a blink
+static float blink_loud_threshold = 0.85f;  // near-max loudness triggers a blink
 static float blink_close_speed    = 8.0f;   // how fast eyelid closes (units/sec)
 static float blink_open_speed     = 3.0f;   // how fast eyelid reopens (units/sec)
 static float blink_hold_time      = 0.08f;  // seconds to hold closed
@@ -1493,7 +1504,13 @@ static void eye_draw_cat(void)
     int ix = CX + (int)eye.px + (int)eye.rpx;
     int iy = CY + (int)eye.py + (int)eye.rpy;
 
-    int pupil_w = 16 + (int)(mic_loudness * 70);
+    // Dilation lives in the top of the auto-gained scale: nothing below
+    // ~55% of max loudness, then a subtle quadratic ramp — the blink
+    // threshold (0.85) takes over before it gets dramatic
+    float dil = (mic_loudness - 0.55f) / 0.45f;
+    if (dil < 0) dil = 0;
+    if (dil > 1) dil = 1;
+    int pupil_w = 16 + (int)(dil * dil * 44.0f);
 
     for (int y = 0; y < H; y++) {
         uint16_t *row = draw_fb + y * W;
@@ -1527,10 +1544,12 @@ static void eye_draw_cat(void)
             }
         }
 
-        int pupil_hw = board->pupil_hw;
-        if (pupil_w > 0 && dy_i >= -pupil_w && dy_i <= pupil_w) {
-            float t = (float)dy_i / (float)pupil_w;
-            int span = (int)(pupil_hw * sqrtf(1.0f - t * t));
+        // Vertical slit pupil: tall (pupil_hw along y), narrow across
+        // (pupil_w in x, widening with loudness)
+        int pupil_hh = board->pupil_hw;
+        if (dy_i >= -pupil_hh && dy_i <= pupil_hh) {
+            float t = (float)dy_i / (float)pupil_hh;
+            int span = (int)(pupil_w * sqrtf(1.0f - t * t));
             if (span < 1) span = 1;
             int x0 = ix - span; if (x0 < sx0) x0 = sx0;
             int x1 = ix + span; if (x1 > sx1) x1 = sx1;
@@ -1539,24 +1558,22 @@ static void eye_draw_cat(void)
     }
 
     if (blink_pos > 0.01f) {
+        // Eyelids close from the top and bottom (matching the vertical slit)
         int lid_travel = (int)(SR * blink_pos);
-        int left_edge  = CX - SR + lid_travel;
-        int right_edge = CX + SR - lid_travel;
+        int top_edge    = CY - SR + lid_travel;
+        int bottom_edge = CY + SR - lid_travel;
 
         for (int y = 0; y < H; y++) {
+            if (y > top_edge && y < bottom_edge) continue;
             int sx0 = sclera_x0[y];
             int sx1 = sclera_x1[y];
             if (sx1 < 0) continue;
 
+            uint16_t col = COL_SKIN;
+            if ((y >= top_edge - 3 && y <= top_edge) ||
+                (y >= bottom_edge && y <= bottom_edge + 3)) col = COL_LASH;
             uint16_t *row = draw_fb + y * W;
-            for (int x = sx0; x <= sx1; x++) {
-                if (x <= left_edge || x >= right_edge) {
-                    uint16_t col = COL_SKIN;
-                    if (x >= left_edge - 3 && x <= left_edge)   col = COL_LASH;
-                    if (x >= right_edge && x <= right_edge + 3) col = COL_LASH;
-                    row[x] = col;
-                }
-            }
+            for (int x = sx0; x <= sx1; x++) row[x] = col;
         }
     }
 }
@@ -3143,6 +3160,8 @@ void app_main(void)
         { 0x0010, "Display Mode",  BLE_PARAM_RWN,  &ble_display_mode,  1 },
         { 0x0022, "Battery V",     BLE_PARAM_STAT, &battery_voltage,   4 },
         { 0x0023, "Battery %",     BLE_PARAM_STAT, &battery_percent,   4 },
+        { 0x0026, "Noise Level",   BLE_PARAM_STAT, &ble_mic_level,     4 },
+        { 0x0027, "Mic Gain",      BLE_PARAM_STAT, &ble_mic_gain,      4 },
         { 0x0025, "Brightness",    BLE_PARAM_RWN,  &display_brightness, 1 },
         { 0x0030, "FW Version",    BLE_PARAM_F_READ, fw_version,      20 },
         { 0x0031, "Rotation",      BLE_PARAM_RWN,  &ble_rotation,      1 },
@@ -3227,6 +3246,16 @@ void app_main(void)
             }
         }
         mic_read_loudness();
+        ble_mic_level = mic_loudness * 100.0f;
+        // Auto-gain on a generic 0-100 scale: log-inverse of the AGC
+        // ceiling over its practical range (ceiling 100 → gain 100,
+        // ceiling 20000 → gain 0)
+        if (mic_ceiling > 1.0f) {
+            float g = 100.0f * logf(20000.0f / mic_ceiling) / logf(200.0f);
+            if (g < 0) g = 0;
+            if (g > 100) g = 100;
+            ble_mic_gain = g;
+        }
 
         // Rotation changed over BLE: apply to the panel and persist
         if ((ble_rotation & 3) != display_rotation) {
