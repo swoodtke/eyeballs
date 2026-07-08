@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -45,6 +46,11 @@ static uint16_t s_conn_handles[MAX_CONNS] = {
 
 // Bond persistence (NimBLE NVS store) — implemented by the ESP port
 void ble_store_config_init(void);
+
+// Set when the firmware version differs from the last boot: bonded centrals
+// (iOS especially) cache our GATT table aggressively, so indicate Service
+// Changed to force them to re-discover the characteristics.
+static bool s_svc_changed_pending = false;
 
 // Notification value handles — one per param
 static uint16_t notify_handles[MAX_PARAMS];
@@ -296,6 +302,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 static void ble_on_sync(void)
 {
     ESP_LOGI(TAG, "BLE host synced");
+    if (s_svc_changed_pending) {
+        // New firmware since last boot — tell bonded centrals to re-discover
+        ble_svc_gatt_changed(0x0001, 0xffff);
+        ESP_LOGI(TAG, "Indicated GATT Service Changed (new firmware)");
+    }
     start_advertising();
 }
 
@@ -332,6 +343,23 @@ void ble_init(const ble_param_t *params, int count)
     }
 
     load_or_generate_name();
+
+    // Detect firmware changes across boots (GATT table may have changed)
+    {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+            const char *cur = esp_app_get_description()->version;
+            char last[32] = {0};
+            size_t len = sizeof(last);
+            nvs_get_str(h, "last_fw", last, &len);
+            if (strcmp(last, cur) != 0) {
+                s_svc_changed_pending = true;
+                nvs_set_str(h, "last_fw", cur);
+                nvs_commit(h);
+            }
+            nvs_close(h);
+        }
+    }
 
     // Init NimBLE
     ret = nimble_port_init();

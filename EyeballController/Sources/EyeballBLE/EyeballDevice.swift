@@ -106,11 +106,16 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
         characteristics.first { $0.id.uuidString == "0030" }?.stringValue
     }
 
+    /// The display rotation characteristic (0-3 = 0/90/180/270 degrees).
+    public var rotationEntry: CharacteristicEntry? {
+        characteristics.first { $0.id.uuidString == "0031" }
+    }
+
     /// Per-variant tunables — everything writable that isn't a generic
-    /// device control (name, display mode). Empty until the firmware
-    /// re-exposes mode-specific params.
+    /// device control (name, display mode, rotation). Empty until the
+    /// firmware re-exposes mode-specific params.
     public var variantParameters: [CharacteristicEntry] {
-        parameters.filter { !["0001", "0010"].contains($0.id.uuidString) }
+        parameters.filter { !["0001", "0010", "0031"].contains($0.id.uuidString) }
     }
 
     /// Current display mode (0=Cat Eye, 1=Hypnotoad, 2=Sauron,

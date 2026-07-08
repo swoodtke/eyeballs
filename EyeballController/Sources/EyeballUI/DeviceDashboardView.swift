@@ -61,6 +61,11 @@ struct DeviceDashboardView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                if let rotation = device.rotationEntry {
+                    RotationRow(entry: rotation, device: device)
+                        .environmentObject(bluetooth)
+                }
             }
 
             if let mode = device.displayModeEntry {
@@ -132,6 +137,34 @@ struct DeviceDashboardView: View {
         guard !trimmed.isEmpty else { return }
         bluetooth.writeDeviceName(trimmed, on: device)
         editingName = false
+    }
+}
+
+/// Display rotation for the mounting orientation (goggle vs pendant).
+private struct RotationRow: View {
+    @ObservedObject var entry: CharacteristicEntry
+    @ObservedObject var device: EyeballDevice
+    @EnvironmentObject var bluetooth: BluetoothManager
+
+    var body: some View {
+        HStack {
+            Text("Rotation")
+            Spacer()
+            Picker("", selection: Binding(
+                get: { Int(entry.uint8Value ?? 0) },
+                set: { newVal in
+                    bluetooth.writeUInt8(UInt8(newVal), to: entry, on: device)
+                    entry.value = Data([UInt8(newVal)])
+                }
+            )) {
+                Text("0°").tag(0)
+                Text("90°").tag(1)
+                Text("180°").tag(2)
+                Text("270°").tag(3)
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 220)
+        }
     }
 }
 

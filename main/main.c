@@ -40,6 +40,8 @@
 #include "board_config.h"
 #include "font8x8_basic.h"
 #include "esp_app_desc.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "eye";
 
@@ -67,6 +69,12 @@ static float current_fps = 0;
 // Firmware version (git describe, stamped by the build) — shown on the
 // status screen and served over BLE so the app can spot stale devices
 static char fw_version[24];
+
+// Display rotation for different mountings (goggle vs pendant):
+// 0/1/2/3 = 0°/90°/180°/270°. Applied in panel hardware via MADCTL
+// (swap_xy + mirror), persisted to NVS, settable over BLE.
+static uint8_t display_rotation = 0;
+static uint8_t ble_rotation = 0;
 static uint8_t display_brightness = 100;  // 0-100%, only used on CO5300 (1.75" board)
 static uint8_t prev_brightness = 100;
 
@@ -106,6 +114,7 @@ typedef struct {
     uint8_t spiral_color_d[3];
     float sauron_blink_pos;
     bool status_screen;
+    uint8_t rotation;      // render-side rotation: 1/3 = 90°/270° (180° is panel hw)
     uint16_t *target_fb;
 } render_params_t;
 
@@ -636,12 +645,25 @@ static bool touch_read_cst9217(int *x, int *y)
 }
 
 /** Poll touch — only reads I2C when TP_INT fired. Returns true when a
- *  touch sample with screen coordinates was captured. */
+ *  touch sample with screen coordinates was captured. Raw coordinates
+ *  are physical-panel space; transform them into the displayed (rotated)
+ *  orientation so gestures follow what the user sees. */
 static bool touch_poll(int *x, int *y)
 {
     if (xSemaphoreTake(tp_sem, 0) != pdTRUE) return false;
-    return board->use_spd2010 ? touch_read_spd2010(x, y)
-                              : touch_read_cst9217(x, y);
+    bool touched = board->use_spd2010 ? touch_read_spd2010(x, y)
+                                      : touch_read_cst9217(x, y);
+    if (touched) {
+        const int W = board->lcd_w, H = board->lcd_h;
+        int rx = *x, ry = *y;
+        switch (display_rotation) {
+        case 1: *x = ry;          *y = W - 1 - rx; break;   // 90°
+        case 2: *x = W - 1 - rx;  *y = H - 1 - ry; break;   // 180°
+        case 3: *x = H - 1 - ry;  *y = rx;         break;   // 270°
+        default: break;
+        }
+    }
+    return touched;
 }
 
 // TE (tearing effect) sync — wait for display vsync before flushing
@@ -705,6 +727,45 @@ static void lcd_flush(void)
     // this buffer becomes the render target next iteration, and Core 1
     // must not overwrite it while the SPI is still streaming from it
     xSemaphoreTake(flush_dma_sem, pdMS_TO_TICKS(100));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Display rotation — panel-hardware MADCTL via esp_lcd swap/mirror ops.
+// NOTE: 90°/270° need the controller's row/column-exchange support; the
+// log below reports the driver's verdict per panel.
+// ─────────────────────────────────────────────────────────────────────────────
+static void apply_rotation(void)
+{
+    // All rotation happens at render time; the panel is never touched.
+    // These AMOLED controllers proved unreliable via MADCTL: the SPD2010
+    // ignores row/column exchange (no 90°) and the CO5300 mirrors wrongly
+    // (180° came out single-axis, and any MADCTL write disturbed 0°).
+    ESP_LOGI(TAG, "Rotation %d deg (render-side)", display_rotation * 90);
+}
+
+static void settings_save_u8(const char *key, uint8_t v)
+{
+    nvs_handle_t h;
+    if (nvs_open("eyeball", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, key, v);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/** Restore persisted user settings (rotation, display mode) at boot. */
+static void settings_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("eyeball", NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, "rotation", &v) == ESP_OK)
+            display_rotation = v & 3;
+        if (nvs_get_u8(h, "mode", &v) == ESP_OK && v < NUM_MODES)
+            display_mode = (display_mode_t)v;
+        nvs_close(h);
+    }
+    ble_rotation = display_rotation;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1514,6 +1575,7 @@ static uint8_t *anim_comp_data = NULL;    // all compressed frames (PSRAM)
 static uint32_t *anim_offsets = NULL;     // per-frame offsets into anim_comp_data
 static uint32_t anim_comp_size = 0;
 static uint8_t *anim_frame_buf = NULL;    // one decoded frame (PSRAM)
+static uint8_t *anim_frame_rot = NULL;    // rotated copy for 90°/270° (PSRAM)
 static int anim_frame_w, anim_frame_h, anim_num_frames;
 static int anim_frame_idx = 0;
 static int anim_playback = 0;   // 0=ping-pong, 1=loop
@@ -1643,7 +1705,8 @@ static void anim_init(const char *name)
     anim_comp_size = anim_size - data_start;
     anim_comp_data = heap_caps_malloc(anim_comp_size + 2, MALLOC_CAP_SPIRAM);
     anim_frame_buf = heap_caps_malloc(frame_pixels, MALLOC_CAP_SPIRAM);
-    if (!anim_comp_data || !anim_frame_buf) {
+    anim_frame_rot = heap_caps_malloc(frame_pixels, MALLOC_CAP_SPIRAM);  // 90°/270°
+    if (!anim_comp_data || !anim_frame_buf || !anim_frame_rot) {
         ESP_LOGE(TAG, "Anim PSRAM alloc failed (%lu bytes)",
                  (unsigned long)(anim_comp_size + frame_pixels));
         heap_caps_free(offsets);
@@ -1674,9 +1737,34 @@ static void anim_free(void)
     if (anim_comp_data) { heap_caps_free(anim_comp_data); anim_comp_data = NULL; }
     if (anim_offsets)   { heap_caps_free(anim_offsets);   anim_offsets = NULL; }
     if (anim_frame_buf) { heap_caps_free(anim_frame_buf); anim_frame_buf = NULL; }
+    if (anim_frame_rot) { heap_caps_free(anim_frame_rot); anim_frame_rot = NULL; }
     anim_comp_size = 0;
     anim_inited = false;
     ESP_LOGI(TAG, "Anim frames freed");
+}
+
+/** Rotate a w×h frame by 90° (cw) or 270° (ccw) into dst, whose dimensions
+ *  become h×w. 16x16 tile-blocked so the column-strided side of the
+ *  transpose stays cache-friendly. */
+static void rotate_frame(const uint8_t *src, uint8_t *dst, int w, int h, bool cw)
+{
+    const int T = 16;
+    for (int by = 0; by < h; by += T) {
+        int ey = by + T > h ? h : by + T;
+        for (int bx = 0; bx < w; bx += T) {
+            int ex = bx + T > w ? w : bx + T;
+            for (int y = by; y < ey; y++) {
+                const uint8_t *srow = src + y * w;
+                if (cw) {
+                    for (int x = bx; x < ex; x++)
+                        dst[x * h + (h - 1 - y)] = srow[x];
+                } else {
+                    for (int x = bx; x < ex; x++)
+                        dst[(w - 1 - x) * h + y] = srow[x];
+                }
+            }
+        }
+    }
 }
 
 static void eye_draw_anim(void)
@@ -1710,6 +1798,31 @@ static void eye_draw_anim(void)
     anim_decode_rle(anim_comp_data + comp_off, comp_len, anim_frame_buf, frame_pixels,
                     &min_px, &max_px);
     const uint8_t *frame = anim_frame_buf;
+
+    // Rotate the decoded frame (dimensions swap at 90/270), then everything
+    // downstream — the optimized blit, dirty bands, flush — works unchanged
+    int fw = anim_frame_w, fh = anim_frame_h;
+    int rot = render_params.rotation;
+    if (rot != 0 && anim_frame_rot) {
+        if (rot == 2) {
+            // 180°: reversed copy
+            for (int i = 0; i < frame_pixels; i++)
+                anim_frame_rot[i] = anim_frame_buf[frame_pixels - 1 - i];
+        } else {
+            rotate_frame(anim_frame_buf, anim_frame_rot,
+                         anim_frame_w, anim_frame_h, rot == 1);
+            fw = anim_frame_h;  fh = anim_frame_w;
+        }
+        frame = anim_frame_rot;
+        // Content extent moved with the rotation — rescan (sequential, cheap)
+        const uint32_t *w32 = (const uint32_t *)frame;
+        int words = frame_pixels / 4;
+        min_px = frame_pixels;  max_px = -1;
+        for (int i = 0; i < words; i++)
+            if (w32[i]) { min_px = i * 4; break; }
+        for (int i = words - 1; i >= 0; i--)
+            if (w32[i]) { max_px = i * 4 + 3; break; }
+    }
     uint16_t bg = anim_palette_rgb565[0];
 
     // Palette entry expanded to the identical 2-pixel pair it becomes at 2x
@@ -1717,8 +1830,8 @@ static void eye_draw_anim(void)
     for (int i = 0; i < 64; i++)
         pal32[i] = (uint32_t)anim_palette_rgb565[i] * 0x00010001u;
 
-    int scaled_w = anim_frame_w * 2;
-    int scaled_h = anim_frame_h * 2;
+    int scaled_w = fw * 2;
+    int scaled_h = fh * 2;
     int ox = (W - scaled_w) / 2;
     int oy = (H - scaled_h) / 2;
     int eye_r2 = SR * SR;
@@ -1726,8 +1839,8 @@ static void eye_draw_anim(void)
     // Screen-row band holding this frame's content
     int cur_y0 = H, cur_y1 = -1;
     if (max_px >= 0) {
-        cur_y0 = oy + (min_px / anim_frame_w) * 2;
-        cur_y1 = oy + (max_px / anim_frame_w) * 2 + 1;
+        cur_y0 = oy + (min_px / fw) * 2;
+        cur_y1 = oy + (max_px / fw) * 2 + 1;
         if (cur_y0 < 0) cur_y0 = 0;
         if (cur_y1 > H - 1) cur_y1 = H - 1;
         if (cur_y1 < cur_y0) { cur_y0 = H; cur_y1 = -1; }
@@ -1775,7 +1888,7 @@ static void eye_draw_anim(void)
 
         int sy = y - oy;
         int fy = sy >> 1;
-        if (sy < 0 || sy >= scaled_h || fy >= anim_frame_h) {
+        if (sy < 0 || sy >= scaled_h || fy >= fh) {
             for (int x = cx0; x <= cx1; x++) out[x] = bg;
             prev_fy = -1;
             continue;
@@ -1788,7 +1901,7 @@ static void eye_draw_anim(void)
         }
         prev_fy = fy;  prev_cx0 = cx0;  prev_cx1 = cx1;
 
-        const uint8_t *frame_row = frame + fy * anim_frame_w;
+        const uint8_t *frame_row = frame + fy * fw;
 
         // Circle regions left/right of the frame get the background colour
         int xa = ox > cx0 ? ox : cx0;
@@ -2167,6 +2280,7 @@ static void battery_init(void)
 static void draw_char8(int x0, int y0, char c, int scale, uint16_t col)
 {
     const int W = board->lcd_w, H = board->lcd_h;
+    const int rot = render_params.rotation;   // 1/3 = render-side 90°/270°
     if ((unsigned char)c > 0x7F) c = '?';
     const unsigned char *glyph = font8x8_basic[(unsigned char)c];
     for (int row = 0; row < 8; row++) {
@@ -2176,11 +2290,15 @@ static void draw_char8(int x0, int y0, char c, int scale, uint16_t col)
             if (!((bits >> cb) & 1)) continue;
             for (int sy = 0; sy < scale; sy++) {
                 int py = y0 + row * scale + sy;
-                if ((unsigned)py >= (unsigned)H) continue;
-                uint16_t *rowp = draw_fb + py * W;
                 for (int sx = 0; sx < scale; sx++) {
                     int px = x0 + cb * scale + sx;
-                    if ((unsigned)px < (unsigned)W) rowp[px] = col;
+                    // Map logical (viewer) coords into the framebuffer
+                    int fx = px, fy = py;
+                    if (rot == 1)      { fx = W - 1 - py;  fy = px; }
+                    else if (rot == 2) { fx = W - 1 - px;  fy = H - 1 - py; }
+                    else if (rot == 3) { fx = py;          fy = H - 1 - px; }
+                    if ((unsigned)fx < (unsigned)W && (unsigned)fy < (unsigned)H)
+                        draw_fb[fy * W + fx] = col;
                 }
             }
         }
@@ -2296,6 +2414,17 @@ void app_main(void)
     battery_init();
     tca9554_init();
     lcd_init();
+
+    // NVS early (idempotent — ble_init re-checks) so the persisted
+    // rotation applies before the first frame is drawn
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+    settings_load();
+    if (display_rotation != 0) apply_rotation();
+
     te_init();
     touch_init();
     imu_init();
@@ -2317,6 +2446,7 @@ void app_main(void)
         { 0x0022, "Battery V",     BLE_PARAM_STAT, &battery_voltage,   4 },
         { 0x0023, "Battery %",     BLE_PARAM_STAT, &battery_percent,   4 },
         { 0x0030, "FW Version",    BLE_PARAM_F_READ, fw_version,      20 },
+        { 0x0031, "Rotation",      BLE_PARAM_RWN,  &ble_rotation,      1 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
@@ -2334,6 +2464,7 @@ void app_main(void)
     memcpy(render_params.spiral_color_d, spiral_color_d, 3);
     render_params.sauron_blink_pos = sauron_blink_pos;
     render_params.status_screen    = status_screen_on;
+    render_params.rotation         = display_rotation;
     xSemaphoreGive(flush_done_sem);
 
     int64_t prev_us = esp_timer_get_time();
@@ -2362,7 +2493,26 @@ void app_main(void)
         // so rendering overlaps with the DMA flush
         float ax, ay, az;
         imu_accel(&ax, &ay, &az);
+        // Rotate the gravity vector into the displayed orientation so the
+        // cat eye's pupil keeps following real-world gravity
+        {
+            float tmp;
+            switch (display_rotation) {
+            case 1: tmp = ax; ax =  ay; ay = -tmp; break;
+            case 2: ax = -ax; ay = -ay; break;
+            case 3: tmp = ax; ax = -ay; ay =  tmp; break;
+            default: break;
+            }
+        }
         mic_read_loudness();
+
+        // Rotation changed over BLE: apply to the panel and persist
+        if ((ble_rotation & 3) != display_rotation) {
+            display_rotation = ble_rotation & 3;
+            ble_rotation = display_rotation;
+            apply_rotation();
+            settings_save_u8("rotation", display_rotation);
+        }
 
         // ── Touch gestures ──
         // Swipe left/right switches modes, long-press toggles the status
@@ -2465,6 +2615,17 @@ void app_main(void)
         if (ble_display_mode >= NUM_MODES) ble_display_mode = 0;
         display_mode = (display_mode_t)ble_display_mode;
 
+        // Persist mode changes (swipe or BLE) so reboots resume where left
+        {
+            static int saved_mode = -1;
+            if (saved_mode < 0) {
+                saved_mode = (int)display_mode;
+            } else if (saved_mode != (int)display_mode) {
+                saved_mode = (int)display_mode;
+                settings_save_u8("mode", (uint8_t)saved_mode);
+            }
+        }
+
         render_params.px           = eye.px;
         render_params.py           = eye.py;
         render_params.rpx          = eye.rpx;
@@ -2480,6 +2641,7 @@ void app_main(void)
         memcpy(render_params.spiral_color_d, spiral_color_d, 3);
         render_params.sauron_blink_pos = sauron_blink_pos;
         render_params.status_screen    = status_screen_on;
+        render_params.rotation         = display_rotation;
         render_params.target_fb    = framebuf[back_idx];
 
         // Start Core 1 rendering into back buffer
