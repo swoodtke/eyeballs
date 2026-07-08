@@ -30,6 +30,11 @@ void eyesync_notify_mode(uint8_t mode);
 /** Announce a locally-originated blink. */
 void eyesync_notify_blink(uint8_t mode);
 
+/** Announce a leader-originated glance (Sauron gaze); `gaze` is the
+ *  packed direction byte defined in main.c (bit 7 = horizontal sign,
+ *  low 7 bits = vertical fraction). */
+void eyesync_notify_gaze(uint8_t mode, uint8_t gaze);
+
 /** Call every main-loop iteration: the leader broadcasts a rate-limited
  *  beacon carrying the current mode and animation clock position
  *  (UINT32_MAX when no animation is active). */
@@ -38,6 +43,7 @@ void eyesync_beacon(uint8_t mode, uint32_t anim_pos_ms);
 /** Collect pending received state (WiFi task → main loop). Returns true if
  *  anything was pending. mode_out = -1 if no mode update; pos_ms_out =
  *  UINT32_MAX if no clock update; pos_mode_out = the mode the clock refers
- *  to (only apply when it matches the local mode). */
+ *  to (only apply when it matches the local mode); gaze_out = -1 if no
+ *  glance, else the packed direction byte. */
 bool eyesync_poll(int *mode_out, bool *blink_out,
-                  uint32_t *pos_ms_out, uint8_t *pos_mode_out);
+                  uint32_t *pos_ms_out, uint8_t *pos_mode_out, int *gaze_out);

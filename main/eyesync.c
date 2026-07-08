@@ -14,6 +14,7 @@ static const char *TAG = "eyesync";
 // Packet: {seq, mode, flags, rsvd, anim_pos_ms(le32)}
 #define FLAG_BLINK  0x01
 #define FLAG_MODE   0x02
+#define FLAG_GAZE   0x04   // aux byte carries the glance direction
 
 #define BEACON_INTERVAL_US 200000   // leader clock beacon: 5 Hz
 
@@ -40,6 +41,7 @@ static volatile int      s_rx_mode = -1;
 static volatile bool     s_rx_blink = false;
 static volatile uint32_t s_rx_pos_ms = UINT32_MAX;
 static volatile uint8_t  s_rx_pos_mode = 0xFF;
+static volatile int      s_rx_gaze = -1;   // aux byte of a gaze packet, -1 = none
 
 static void start_scan(void);
 
@@ -48,6 +50,7 @@ static void parse_pkt(const uint8_t *p)
     uint8_t flags = p[2];
     if (flags & FLAG_MODE)  s_rx_mode = p[1];
     if (flags & FLAG_BLINK) s_rx_blink = true;
+    if (flags & FLAG_GAZE)  s_rx_gaze = p[3];
     uint32_t pos = (uint32_t)p[4] | ((uint32_t)p[5] << 8) |
                    ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
     if (pos != UINT32_MAX) {
@@ -56,13 +59,14 @@ static void parse_pkt(const uint8_t *p)
     }
 }
 
-static void fill_pkt(uint8_t *p, uint8_t mode, uint8_t flags, uint32_t pos_ms)
+static void fill_pkt(uint8_t *p, uint8_t mode, uint8_t flags, uint32_t pos_ms,
+                     uint8_t aux)
 {
     p[0] = ++s_seq;
     if (s_seq == 0) p[0] = ++s_seq;   // 0 means "never written"
     p[1] = mode;
     p[2] = flags;
-    p[3] = 0;
+    p[3] = aux;
     p[4] = pos_ms & 0xFF;
     p[5] = (pos_ms >> 8) & 0xFF;
     p[6] = (pos_ms >> 16) & 0xFF;
@@ -70,27 +74,29 @@ static void fill_pkt(uint8_t *p, uint8_t mode, uint8_t flags, uint32_t pos_ms)
 }
 
 // ── Left/central: send by writing the peer's characteristic ──
-static void central_send(uint8_t mode, uint8_t flags, uint32_t pos_ms)
+static void central_send(uint8_t mode, uint8_t flags, uint32_t pos_ms,
+                         uint8_t aux)
 {
     if (!s_ready || s_conn == BLE_HS_CONN_HANDLE_NONE) return;
     uint8_t pkt[EYESYNC_PKT_LEN];
-    fill_pkt(pkt, mode, flags, pos_ms);
+    fill_pkt(pkt, mode, flags, pos_ms, aux);
     ble_gattc_write_no_rsp_flat(s_conn, s_val_handle, pkt, sizeof(pkt));
 }
 
 // ── Right/peripheral: send by updating the buffer and notifying ──
-static void peripheral_send(uint8_t mode, uint8_t flags, uint32_t pos_ms)
+static void peripheral_send(uint8_t mode, uint8_t flags, uint32_t pos_ms,
+                            uint8_t aux)
 {
-    fill_pkt(eyesync_gatt_buf, mode, flags, pos_ms);
+    fill_pkt(eyesync_gatt_buf, mode, flags, pos_ms, aux);
     s_gatt_last_seq = eyesync_gatt_buf[0];   // don't echo our own packet
     ble_notify_param(EYESYNC_CHR_UUID);
 }
 
-static void send_pkt(uint8_t mode, uint8_t flags, uint32_t pos_ms)
+static void send_pkt(uint8_t mode, uint8_t flags, uint32_t pos_ms, uint8_t aux)
 {
     if (s_group == 0) return;
-    if (s_role == 0) central_send(mode, flags, pos_ms);
-    else             peripheral_send(mode, flags, pos_ms);
+    if (s_role == 0) central_send(mode, flags, pos_ms, aux);
+    else             peripheral_send(mode, flags, pos_ms, aux);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,12 +227,17 @@ void eyesync_set(uint8_t group, uint8_t role)
 
 void eyesync_notify_mode(uint8_t mode)
 {
-    send_pkt(mode, FLAG_MODE, UINT32_MAX);
+    send_pkt(mode, FLAG_MODE, UINT32_MAX, 0);
 }
 
 void eyesync_notify_blink(uint8_t mode)
 {
-    send_pkt(mode, FLAG_BLINK, UINT32_MAX);
+    send_pkt(mode, FLAG_BLINK, UINT32_MAX, 0);
+}
+
+void eyesync_notify_gaze(uint8_t mode, uint8_t gaze)
+{
+    send_pkt(mode, FLAG_GAZE, UINT32_MAX, gaze);
 }
 
 void eyesync_beacon(uint8_t mode, uint32_t anim_pos_ms)
@@ -235,11 +246,11 @@ void eyesync_beacon(uint8_t mode, uint32_t anim_pos_ms)
     int64_t now = esp_timer_get_time();
     if (now - s_last_beacon_us < BEACON_INTERVAL_US) return;
     s_last_beacon_us = now;
-    send_pkt(mode, FLAG_MODE, anim_pos_ms);
+    send_pkt(mode, FLAG_MODE, anim_pos_ms, 0);
 }
 
 bool eyesync_poll(int *mode_out, bool *blink_out,
-                  uint32_t *pos_ms_out, uint8_t *pos_mode_out)
+                  uint32_t *pos_ms_out, uint8_t *pos_mode_out, int *gaze_out)
 {
     // Left/central: (re)start the partner scan if it isn't running — covers
     // the host not being synced yet at eyesync_set time and scan failures
@@ -266,9 +277,12 @@ bool eyesync_poll(int *mode_out, bool *blink_out,
     *blink_out    = s_rx_blink;
     *pos_ms_out   = s_rx_pos_ms;
     *pos_mode_out = s_rx_pos_mode;
-    bool any = (s_rx_mode >= 0) || s_rx_blink || (s_rx_pos_ms != UINT32_MAX);
+    *gaze_out     = s_rx_gaze;
+    bool any = (s_rx_mode >= 0) || s_rx_blink ||
+               (s_rx_pos_ms != UINT32_MAX) || (s_rx_gaze >= 0);
     s_rx_mode   = -1;
     s_rx_blink  = false;
     s_rx_pos_ms = UINT32_MAX;
+    s_rx_gaze   = -1;
     return any;
 }

@@ -139,6 +139,9 @@ typedef struct {
     uint8_t spiral_color_c[3];
     uint8_t spiral_color_d[3];
     float sauron_blink_pos;
+    float sauron_gaze;         // signed gaze turn: -0.35 left … +0.35 right
+    float sauron_gaze_v;       // signed vertical gaze: -0.18 up … +0.18 down
+    float sauron_stare;        // glance envelope 0…1 (pupil stare shape)
     uint8_t glow_color;
     float ball_x, ball_y;   // ball mode: offset from eye center, pixels
     float ball_flash;       // ball mode: 0-1 sudden-motion brightness pulse
@@ -2131,43 +2134,185 @@ static float sauron_blink_pos = 0;     // 0=open, 1=fully narrowed
 static int   sauron_blink_state = 0;   // 0=idle, 1=closing, 2=hold, 3=opening
 static float sauron_blink_hold = 0;
 
+// Sauron gaze state — now and then the eye slowly glances to one side:
+// the image shifts toward the gaze, compressing on that side and
+// stretching on the trailing side, like the eyeball turning
+static float sauron_gaze_timer = 0;
+static float sauron_gaze_pos = 0;      // 0=looking ahead, 1=fully turned
+static int   sauron_gaze_state = 0;    // 0=idle, 1=turning, 2=hold, 3=returning
+static float sauron_gaze_dir = 1;      // -1 = left, +1 = right
+static float sauron_gaze_vfrac = 0;    // vertical tilt of this glance, -1…1
+static float sauron_gaze_next = 8.0f;  // idle seconds until the next glance
+static float sauron_gaze_hold = 0;
+
+/** Pack/unpack a glance direction for the eyesync packet's aux byte:
+ *  bit 7 = horizontal sign, low 7 bits = vertical fraction (0…120 ≈ -1…1).
+ *  Paired eyes glance together — the packed byte keeps them identical. */
+static uint8_t gaze_pack(void)
+{
+    int v = (int)(sauron_gaze_vfrac * 60.0f) + 60;
+    if (v < 0) v = 0;
+    if (v > 120) v = 120;
+    return (uint8_t)((sauron_gaze_dir > 0 ? 0x80 : 0) | v);
+}
+
+static void gaze_unpack(uint8_t aux)
+{
+    sauron_gaze_dir   = (aux & 0x80) ? 1.0f : -1.0f;
+    sauron_gaze_vfrac = ((float)(aux & 0x7F) - 60.0f) / 60.0f;
+}
+
+/** Scale a byte-swapped RGB565 pixel by t/256 (0 = black, 256 = unchanged). */
+static inline uint16_t px_scale(uint16_t v, int t)
+{
+    uint16_t p = (uint16_t)((v >> 8) | (v << 8));
+    int r = (((p >> 11) & 0x1F) * t) >> 8;
+    int g = (((p >> 5)  & 0x3F) * t) >> 8;
+    int b = ((p & 0x1F) * t) >> 8;
+    p = (uint16_t)((r << 11) | (g << 5) | b);
+    return (uint16_t)((p >> 8) | (p << 8));
+}
+
+/** Gaze warp — post-process on the finished frame (fire + slit), so the
+ *  pupil turns with the eye. Columns remap through the quadratic
+ *  f(u) = u + c·(1-u²): the center shifts toward the gaze side, content
+ *  compresses there and stretches on the trailing side, and f(±1) = ±1
+ *  pins both edges so no gaps open up. |c| < 0.5 keeps f monotonic. */
+static void eye_gaze_warp(void)
+{
+    // f(0) = c is where the CENTER samples from, so content moves opposite
+    // to c's sign — negate so positive gaze = eye looks right/down
+    float c  = -render_params.sauron_gaze;
+    float cv = -render_params.sauron_gaze_v;
+    bool horiz = (c < -0.005f || c > 0.005f);
+    bool vert  = (cv < -0.005f || cv > 0.005f);
+    if (!horiz && !vert) return;
+
+    const int W = board->lcd_w, H = board->lcd_h;
+
+    if (horiz) {
+        const int cx = board->eye_cx;
+        static uint16_t gaze_map[512];     // W ≤ 466 on both boards
+        static uint16_t rowbuf[512];
+
+        float half_l = (float)cx, half_r = (float)(W - 1 - cx);
+        for (int x = 0; x < W; x++) {
+            float u = (x - cx) / ((x < cx) ? half_l : half_r);
+            float f = u + c * (1.0f - u * u);
+            int sx = cx + (int)(f * ((f < 0) ? half_l : half_r));
+            if (sx < 0) sx = 0;
+            if (sx > W - 1) sx = W - 1;
+            gaze_map[x] = (uint16_t)sx;
+        }
+
+        for (int y = 0; y < H; y++) {
+            uint16_t *row = draw_fb + y * W;
+            memcpy(rowbuf, row, W * sizeof(uint16_t));
+            for (int x = 0; x < W; x++)
+                row[x] = rowbuf[gaze_map[x]];
+        }
+    }
+
+    if (vert) {
+        // Same quadratic map applied to rows. In-place is safe: for cv > 0
+        // every source row lies below its destination, so walking top-down
+        // never reads an overwritten row; cv < 0 mirrors bottom-up.
+        const int cy = board->eye_cy;
+        float half_t = (float)cy, half_b = (float)(H - 1 - cy);
+        for (int i = 0; i < H; i++) {
+            int y = (cv > 0) ? i : H - 1 - i;
+            float u = (y - cy) / ((y < cy) ? half_t : half_b);
+            float f = u + cv * (1.0f - u * u);
+            int sy = cy + (int)(f * ((f < 0) ? half_t : half_b));
+            if (sy < 0) sy = 0;
+            if (sy > H - 1) sy = H - 1;
+            if (sy != y)
+                memcpy(draw_fb + y * W, draw_fb + sy * W,
+                       W * sizeof(uint16_t));
+        }
+    }
+
+    // The warp touches pixels across the whole frame
+    int buf = (draw_fb == framebuf[1]) ? 1 : 0;
+    flush_band_y0[buf] = 0;
+    flush_band_y1[buf] = H - 1;
+}
+
 static void eye_draw_sauron(void)
 {
     const int W = board->lcd_w, H = board->lcd_h;
-    const int CX = board->eye_cx, CY = board->eye_cy;
+    const int cx = board->eye_cx, cy = board->eye_cy;
+
+    // The gaze warp remaps columns across the whole frame: stale warped
+    // pixels from this buffer's previous use must not survive under a
+    // narrowed blit band, so force full redraws while the warp is
+    // (recently) active — the reset keeps the NEXT two buffer draws full
+    // as well, scrubbing both framebuffers after the glance ends
+    if (render_params.sauron_gaze   < -0.005f || render_params.sauron_gaze   > 0.005f ||
+        render_params.sauron_gaze_v < -0.005f || render_params.sauron_gaze_v > 0.005f)
+        anim_full_draws = 0;
 
     eye_draw_anim();
 
-    int base_w = board->sauron_base_w + (int)(mic_loudness * 24);
-    int slit_half_h = board->slit_half_h;
-
+    // Pupil slit: fixed base width, narrowed by the periodic blink
+    int base_w = board->sauron_base_w;
     float open = 1.0f - render_params.sauron_blink_pos;
     int min_w = (int)(base_w * 0.2f);
     if (min_w < 1) min_w = 1;
-    int slit_half_w = min_w + (int)((base_w - min_w) * open);
+    int a = min_w + (int)((base_w - min_w) * open);   // semi-axis across the slit
+    int b = board->slit_half_h;                       // semi-axis along the slit
 
-    int cx = CX, cy = CY;
-    if (slit_half_w < 1) slit_half_w = 1;
-    if (slit_half_h < 1) slit_half_h = 1;
-    int sw2 = slit_half_w * slit_half_w;
-    int sh2 = slit_half_h * slit_half_h;
+    // Intense stare: as the glance lands, the pupil widens across and
+    // shortens along the slit — and leads the gaze a bit farther than the
+    // background warp carries it (the warp shifts this drawn position too)
+    float stare = render_params.sauron_stare;
+    a = (int)(a * (1.0f + 0.6f * stare));
+    b = (int)(b * (1.0f - 0.30f * stare));
+    if (a < 1) a = 1;
+    if (b < 1) b = 1;
+    int scx = cx + (int)(render_params.sauron_gaze   * 100.0f);
+    int scy = cy + (int)(render_params.sauron_gaze_v * 100.0f);
 
-    int y0 = cy - slit_half_h - 2; if (y0 < 0) y0 = 0;
-    int y1 = cy + slit_half_h + 2; if (y1 >= H) y1 = H - 1;
-    int x0 = cx - slit_half_w - 2; if (x0 < 0) x0 = 0;
-    int x1 = cx + slit_half_w + 2; if (x1 >= W) x1 = W - 1;
+    // The fire animation rotates with the display; rotate the slit with it
+    // — at 90°/270° it lies horizontal (axes swap; 180° is symmetric, and
+    // the blink still narrows the short axis)
+    int rot = render_params.rotation;
+    if (rot == 1 || rot == 3) { int t = a; a = b; b = t; }
+
+    // Soft edge: solid black inside the slit ellipse, fading back to fire
+    // over ~30% beyond it (a few px across the slit; wider at the tips,
+    // which reads as a natural taper)
+    const float feather = 0.30f;
+    int ao = a * 13 / 10 + 2, bo = b * 13 / 10 + 2;   // feather outer bound
+    int a2 = a * a,   b2 = b * b;
+    int ao2 = ao * ao, bo2 = bo * bo;
+
+    int y0 = scy - bo; if (y0 < 0) y0 = 0;
+    int y1 = scy + bo; if (y1 >= H) y1 = H - 1;
+    int x0 = scx - ao; if (x0 < 0) x0 = 0;
+    int x1 = scx + ao; if (x1 >= W) x1 = W - 1;
 
     for (int y = y0; y <= y1; y++) {
-        int dy = y - cy;
-        int dy2_sh2 = dy * dy * sw2;
-        int row = y * W;
+        int dy2 = (y - scy) * (y - scy);
+        uint16_t *out = draw_fb + y * W;
         for (int x = x0; x <= x1; x++) {
-            int dxx = x - cx;
-            if (dxx * dxx * sh2 + dy2_sh2 <= sw2 * sh2) {
-                draw_fb[row + x] = COL_BLACK;
+            int dx2 = (x - scx) * (x - scx);
+            if (dx2 * b2 + dy2 * a2 <= a2 * b2) {
+                out[x] = COL_BLACK;                    // solid pupil
+            } else if (dx2 * bo2 + dy2 * ao2 <= ao2 * bo2) {
+                // Feather band: darken the fire toward the pupil edge
+                float e = (float)dx2 / a2 + (float)dy2 / b2;
+                float alpha = (sqrtf(e) - 1.0f) / feather;
+                if (alpha < 1.0f) {
+                    int t = (int)(alpha * 256.0f);
+                    if (t < 0) t = 0;
+                    out[x] = px_scale(out[x], t);
+                }
             }
         }
     }
+
+    eye_gaze_warp();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3029,6 +3174,12 @@ void app_main(void)
     memcpy(render_params.spiral_color_c, spiral_color_c, 3);
     memcpy(render_params.spiral_color_d, spiral_color_d, 3);
     render_params.sauron_blink_pos = sauron_blink_pos;
+    {   // Smoothstep: the glance eases out of and back into dead-ahead
+        float gp = sauron_gaze_pos * sauron_gaze_pos * (3.0f - 2.0f * sauron_gaze_pos);
+        render_params.sauron_gaze   = sauron_gaze_dir * gp * 0.35f;
+        render_params.sauron_gaze_v = sauron_gaze_vfrac * gp * 0.18f;
+        render_params.sauron_stare  = gp;
+    }
     render_params.glow_color       = glow_color;
     render_params.ball_x           = ball_px;
     render_params.ball_y           = ball_py;
@@ -3163,7 +3314,12 @@ void app_main(void)
         // Sauron periodic blink: close → hold → reopen
         switch (sauron_blink_state) {
         case 0:  // idle — wait for timer
-            sauron_blink_timer += dt;
+            // No new blinks while a glance is in progress: a blink started
+            // just before a glance (worst case ~0.9s) always finishes
+            // during the 1.2s turn, so the stare itself is never blinked
+            // over — and the eyes never blink mid-stare
+            if (sauron_gaze_state == 0)
+                sauron_blink_timer += dt;
             if (sauron_blink_timer > 4.0f) {
                 sauron_blink_state = 1;
                 sauron_blink_timer = 0;
@@ -3193,6 +3349,48 @@ void app_main(void)
             break;
         }
 
+        // Sauron gaze: slowly glance to one side (and a bit up or down),
+        // hold, drift back. On a synced pair only the leader originates —
+        // the right eye starts identical glances from the gaze packet.
+        switch (sauron_gaze_state) {
+        case 0:  // idle
+            sauron_gaze_timer += dt;
+            if ((sync_group == 0 || sync_role == 0) &&
+                sauron_gaze_timer > sauron_gaze_next) {
+                sauron_gaze_state = 1;
+                sauron_gaze_timer = 0;
+                sauron_gaze_dir = (esp_random() & 1) ? 1.0f : -1.0f;
+                sauron_gaze_vfrac = ((int)(esp_random() % 2001) - 1000) / 1000.0f;
+                if (sync_group != 0)
+                    eyesync_notify_gaze((uint8_t)display_mode, gaze_pack());
+                ESP_LOGI(TAG, "Sauron glances %s (tilt %.2f)",
+                         sauron_gaze_dir > 0 ? "right" : "left",
+                         sauron_gaze_vfrac);
+            }
+            break;
+        case 1:  // turning over ~1.2s
+            sauron_gaze_pos += dt * 0.8f;
+            if (sauron_gaze_pos >= 1.0f) {
+                sauron_gaze_pos = 1.0f;
+                sauron_gaze_state = 2;
+                sauron_gaze_hold = 0;
+            }
+            break;
+        case 2:  // hold the stare (fixed length: paired eyes stay in step)
+            sauron_gaze_hold += dt;
+            if (sauron_gaze_hold > 1.5f)
+                sauron_gaze_state = 3;
+            break;
+        case 3:  // drifting back, slower than the turn out (~2.5s)
+            sauron_gaze_pos -= dt * 0.4f;
+            if (sauron_gaze_pos <= 0) {
+                sauron_gaze_pos = 0;
+                sauron_gaze_state = 0;
+                sauron_gaze_next = 7.0f + (esp_random() % 7000) / 1000.0f;
+            }
+            break;
+        }
+
         if (ble_display_mode >= NUM_MODES) ble_display_mode = 0;
         display_mode = (display_mode_t)ble_display_mode;
 
@@ -3213,8 +3411,8 @@ void app_main(void)
                 applied_role = sync_role;
             }
 
-            int sm; bool sblink; uint32_t spos; uint8_t spos_mode;
-            if (eyesync_poll(&sm, &sblink, &spos, &spos_mode)) {
+            int sm; bool sblink; uint32_t spos; uint8_t spos_mode; int sgaze;
+            if (eyesync_poll(&sm, &sblink, &spos, &spos_mode, &sgaze)) {
                 if (sm >= 0 && sm < NUM_MODES && (display_mode_t)sm != display_mode) {
                     display_mode = (display_mode_t)sm;
                     ble_display_mode = (uint8_t)sm;
@@ -3228,6 +3426,12 @@ void app_main(void)
                         glow_sync_clock(spos);
                     else
                         anim_sync_clock(spos);
+                }
+                if (sgaze >= 0 && display_mode == MODE_SAURON) {
+                    // Leader glanced: start the identical glance here
+                    gaze_unpack((uint8_t)sgaze);
+                    sauron_gaze_state = 1;
+                    sauron_gaze_timer = 0;
                 }
             }
             if (sync_blink_at_us && now_us >= sync_blink_at_us) {
@@ -3284,6 +3488,12 @@ void app_main(void)
         memcpy(render_params.spiral_color_c, spiral_color_c, 3);
         memcpy(render_params.spiral_color_d, spiral_color_d, 3);
         render_params.sauron_blink_pos = sauron_blink_pos;
+        {   // Smoothstep: the glance eases out of and back into dead-ahead
+            float gp = sauron_gaze_pos * sauron_gaze_pos * (3.0f - 2.0f * sauron_gaze_pos);
+            render_params.sauron_gaze   = sauron_gaze_dir * gp * 0.35f;
+            render_params.sauron_gaze_v = sauron_gaze_vfrac * gp * 0.18f;
+            render_params.sauron_stare  = gp;
+        }
         render_params.glow_color       = glow_color;
         render_params.ball_x           = ball_px;
         render_params.ball_y           = ball_py;

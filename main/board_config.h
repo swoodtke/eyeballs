@@ -112,7 +112,7 @@ static const board_config_t board_config_146 = {
     .inner_r     = 50,
     .rim_r       = 110,
     .pupil_hw    = 90,
-    .slit_half_h = 70,
+    .slit_half_h = 60,
     .sauron_base_w = 14,
 
     .pin_lcd_sda0 = 46, .pin_lcd_sda1 = 45,
@@ -171,7 +171,7 @@ static const board_config_t board_config_175 = {
     .inner_r     = 57,
     .rim_r       = 124,
     .pupil_hw    = 102,
-    .slit_half_h = 79,
+    .slit_half_h = 68,
     .sauron_base_w = 16,
 
     .pin_lcd_sda0 = 4, .pin_lcd_sda1 = 5,
