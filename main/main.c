@@ -90,6 +90,13 @@ static uint8_t sync_role = 0;
 // (both boards carry one; probed at runtime).
 static int64_t clock_midnight_us = 0;
 static bool clock_valid = false;
+
+// BLE-triggered power off (for boards missing the physical button). The
+// magic value guards against a stray one-byte write shutting a device
+// down; the app writes it after user confirmation. Waking a buttonless
+// board back up = plug in USB (VBUS insertion is a PMIC wake source).
+#define POWER_OFF_MAGIC 0xDD
+static uint8_t ble_power_off = 0;
 static uint32_t ble_clock = 0xFFFFFFFF;   // BLE-visible: local secs since midnight
 static uint8_t display_brightness = 100;  // 0-100%, persisted, set over BLE
 static uint8_t prev_brightness = 100;
@@ -131,7 +138,8 @@ typedef struct {
     uint8_t spiral_color_d[3];
     float sauron_blink_pos;
     bool status_screen;
-    uint8_t rotation;      // render-side rotation: 1/3 = 90°/270° (180° is panel hw)
+    uint8_t rotation;      // render-side rotation (all handled in the renderer)
+    bool mirrored;         // right eye of a synced pair: counter-rotate visuals
     uint16_t *target_fb;
 } render_params_t;
 
@@ -1662,12 +1670,21 @@ static void eye_draw_hypnotoad(void)
     uint32_t zoom_mult = (uint32_t)(spiral_zoom * 65536.0f * 65536.0f
                                     / (SPIRAL_DIST_SCALE * 2.0f * (float)M_PI));
 
+    // Right eye of a synced pair: reflect the angle across the vertical axis
+    // through the eye center (0x8000 - ang in turn units). A true mirror —
+    // flips the spiral's handedness and reverses its apparent spin. Must live
+    // here, not as a phase flip in the snapshot: render_task copies the
+    // snapshot phase back into the Core-0 accumulator, so a flipped snapshot
+    // would re-flip every frame and the phase would never advance.
+    const bool mir = render_params.mirrored;
+
     uint16_t black = COL_BLACK;
     for (int i = 0; i < lcd_pixels; i++) {
         if (!spiral_mask[i]) {
             draw_fb[i] = black;
         } else {
             uint16_t ang = spiral_angle_lut[i];
+            if (mir) ang = (uint16_t)(0x8000 - ang);
             uint16_t dist_val = (uint16_t)(((uint32_t)spiral_dist_lut[i] * zoom_mult) >> 16);
             uint16_t combined = (uint16_t)(ang + dist_val - phase_offset);
             draw_fb[i] = spiral_pal256[combined >> 8];
@@ -1854,17 +1871,28 @@ static uint32_t anim_position_ms(void)
     return (uint32_t)((esp_timer_get_time() - anim_start_us) / 1000);
 }
 
-/** Align the animation clock to a peer's position. Only snaps when the
- *  drift exceeds 50 ms so beacon jitter doesn't cause visible stutter.
- *  (anim_start_us is read by the render core; a torn 64-bit read would
- *  glitch a single frame at worst.) */
+/** Align the animation clock to a peer's position. The measured drift
+ *  includes BLE delivery plus up to a frame of poll latency (~50 ms of
+ *  jitter at 20 fps), so corrections are slewed — at most 8 ms (a quarter
+ *  frame, invisible) per beacon, 40 ms/s of authority at the 5 Hz beacon
+ *  rate — rather than snapped; an outlier beacon must never step the
+ *  animation visibly. Only a huge drift (fresh connect, mode change)
+ *  snaps outright. (anim_start_us is read by the render core; a torn
+ *  64-bit read would glitch a single frame at worst.) */
 static void anim_sync_clock(uint32_t pos_ms)
 {
     if (!anim_inited) return;
     int64_t target = esp_timer_get_time() - (int64_t)pos_ms * 1000;
     int64_t drift = target - anim_start_us;
-    if (drift > 50000 || drift < -50000)
+    if (drift > 400000 || drift < -400000) {
+        ESP_LOGW(TAG, "ANIM CLOCK SNAP %+lld ms", (long long)(drift / 1000));
         anim_start_us = target;
+    } else if (drift > 20000 || drift < -20000) {
+        int64_t step = drift / 4;
+        if (step > 8000)  step = 8000;
+        if (step < -8000) step = -8000;
+        anim_start_us += step;
+    }
 }
 
 static void anim_free(void)
@@ -1933,6 +1961,18 @@ static void eye_draw_anim(void)
     anim_decode_rle(anim_comp_data + comp_off, comp_len, anim_frame_buf, frame_pixels,
                     &min_px, &max_px);
     const uint8_t *frame = anim_frame_buf;
+
+    // Right eye of a synced pair: mirror the frame horizontally so paired
+    // spirals counter-rotate (rings still shrink inward; the heart is
+    // symmetric). In-place row reversal keeps the row-band math valid.
+    if (render_params.mirrored) {
+        for (int y = 0; y < anim_frame_h; y++) {
+            uint8_t *row = anim_frame_buf + y * anim_frame_w;
+            for (int i = 0, j = anim_frame_w - 1; i < j; i++, j--) {
+                uint8_t t = row[i]; row[i] = row[j]; row[j] = t;
+            }
+        }
+    }
 
     // Rotate the decoded frame (dimensions swap at 90/270), then everything
     // downstream — the optimized blit, dirty bands, flush — works unchanged
@@ -2495,6 +2535,13 @@ static void draw_status_screen(void)
     draw_text_centered(y, line, 2, col_title);
     y += 38;
 
+    if (sync_group != 0) {
+        snprintf(line, sizeof(line), "SYNC G%u %s", sync_group,
+                 sync_role ? "RIGHT MIR" : "LEFT");
+        draw_text_centered(y, line, 2, col_label);
+        y += 38;
+    }
+
     snprintf(line, sizeof(line), "FPS %.1f", current_fps);
     draw_text_centered(y, line, 2, col_dim);
     y += 38;
@@ -2683,14 +2730,17 @@ void app_main(void)
         { 0x0031, "Rotation",      BLE_PARAM_RWN,  &ble_rotation,      1 },
         { 0x0032, "Sync Group",    BLE_PARAM_RWN,  &sync_group,        1 },
         { 0x0033, "Sync Role",     BLE_PARAM_RWN,  &sync_role,         1 },
-        { EYESYNC_CHR_UUID, "Sync Data", BLE_PARAM_RWN, eyesync_gatt_buf,
-          EYESYNC_PKT_LEN },
+        { EYESYNC_CHR_UUID, "Sync Data", BLE_PARAM_RWN | BLE_PARAM_F_QUIET,
+          eyesync_gatt_buf, EYESYNC_PKT_LEN },
         { 0x0034, "Clock",         BLE_PARAM_RW,   &ble_clock,         4 },
+        { 0x0035, "Power Off",     BLE_PARAM_RW,   &ble_power_off,     1 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
     // Eye-to-eye sync (starts WiFi/ESP-NOW only if a group is configured)
     eyesync_set(sync_group, sync_role);
+    ESP_LOGI(TAG, "Sync group=%u role=%u mirrored=%d",
+             sync_group, sync_role, sync_group != 0 && sync_role == 1);
 
     // Launch render task on Core 1
     xTaskCreatePinnedToCore(render_task, "render", 8192, NULL, 5, NULL, 1);
@@ -2707,6 +2757,7 @@ void app_main(void)
     render_params.sauron_blink_pos = sauron_blink_pos;
     render_params.status_screen    = status_screen_on;
     render_params.rotation         = display_rotation;
+    render_params.mirrored         = (sync_group != 0 && sync_role == 1);
     xSemaphoreGive(flush_done_sem);
 
     int64_t prev_us = esp_timer_get_time();
@@ -2949,6 +3000,7 @@ void app_main(void)
         render_params.sauron_blink_pos = sauron_blink_pos;
         render_params.status_screen    = status_screen_on;
         render_params.rotation         = display_rotation;
+        render_params.mirrored         = (sync_group != 0 && sync_role == 1);
         render_params.target_fb    = framebuf[back_idx];
 
         // Start Core 1 rendering into back buffer
@@ -3024,6 +3076,13 @@ void app_main(void)
             } else {
                 pwr_btn_down_since = 0;
             }
+        }
+
+        // BLE-triggered power off (boards missing the physical button)
+        if (ble_power_off == POWER_OFF_MAGIC) {
+            ESP_LOGW(TAG, "Power off requested over BLE");
+            power_off();
+            ble_power_off = 0;   // in case power_off() is unavailable
         }
     }
 }

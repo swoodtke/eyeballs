@@ -9,6 +9,7 @@ struct DeviceDashboardView: View {
     @State private var newName = ""
     @FocusState private var nameFieldFocused: Bool
     @State private var logTimer: Timer?
+    @State private var confirmingPowerOff = false
 
     var body: some View {
         Form {
@@ -80,6 +81,21 @@ struct DeviceDashboardView: View {
                    (device.syncGroupEntry?.uint8Value ?? 0) != 0 {
                     SyncRoleRow(entry: role, device: device)
                         .environmentObject(bluetooth)
+                }
+
+                if let powerOff = device.powerOffEntry {
+                    Button("Power Off…", role: .destructive) {
+                        confirmingPowerOff = true
+                    }
+                    .confirmationDialog(
+                        "Power off \(device.name)? Waking a device without a power button requires plugging in USB.",
+                        isPresented: $confirmingPowerOff,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Power Off", role: .destructive) {
+                            bluetooth.writeUInt8(0xDD, to: powerOff, on: device)
+                        }
+                    }
                 }
             }
 

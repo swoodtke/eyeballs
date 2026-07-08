@@ -6,6 +6,11 @@
 #define BLE_PARAM_F_READ    0x02
 #define BLE_PARAM_F_WRITE   0x08
 #define BLE_PARAM_F_NOTIFY  0x10
+// Not a NimBLE flag (stripped before GATT registration): exclude from
+// ble_notify_all(). For transport channels like eye-sync whose current
+// buffer contents must never be re-broadcast — echoing a stale sync
+// packet back to the peer corrupts its animation clock.
+#define BLE_PARAM_F_QUIET   0x40
 
 // Convenience combos
 #define BLE_PARAM_RW     (BLE_PARAM_F_READ | BLE_PARAM_F_WRITE)

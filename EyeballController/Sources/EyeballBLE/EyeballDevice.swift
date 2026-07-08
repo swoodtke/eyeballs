@@ -116,6 +116,11 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
         characteristics.first { $0.id.uuidString == "0025" }
     }
 
+    /// Write-only power-off trigger (guarded by a magic byte).
+    public var powerOffEntry: CharacteristicEntry? {
+        characteristics.first { $0.id.uuidString == "0035" }
+    }
+
     /// Eye-sync group (0 = off) and role (0 = left/leader, 1 = right).
     public var syncGroupEntry: CharacteristicEntry? {
         characteristics.first { $0.id.uuidString == "0032" }
@@ -129,8 +134,8 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
     /// the firmware re-exposes mode-specific params.
     public var variantParameters: [CharacteristicEntry] {
         parameters.filter {
-            !["0001", "0010", "0025", "0031", "0032", "0033", "0034", "0040"]
-                .contains($0.id.uuidString)
+            !["0001", "0010", "0025", "0031", "0032", "0033", "0034", "0035",
+              "0040"].contains($0.id.uuidString)
         }
     }
 

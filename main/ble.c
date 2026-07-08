@@ -167,7 +167,7 @@ static void build_gatt_table(void)
 
     // Registered params
     for (int i = 0; i < s_param_count && ci < MAX_PARAMS + 1; i++, ci++) {
-        uint16_t flags = s_params[i].flags;
+        uint16_t flags = s_params[i].flags & ~BLE_PARAM_F_QUIET;
         if (flags & BLE_PARAM_F_WRITE)
             flags |= BLE_GATT_CHR_F_WRITE_ENC;
         chr_uuids[ci] = (ble_uuid16_t)BLE_UUID16_INIT(s_params[i].uuid16);
@@ -483,6 +483,7 @@ void ble_notify_all(void)
 
         for (int i = 0; i < s_param_count; i++) {
             if (!(s_params[i].flags & BLE_PARAM_F_NOTIFY)) continue;
+            if (s_params[i].flags & BLE_PARAM_F_QUIET) continue;
             if (notify_handles[i] == 0) continue;
 
             struct os_mbuf *om = ble_hs_mbuf_from_flat(s_params[i].data, s_params[i].data_len);
