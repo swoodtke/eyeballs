@@ -111,6 +111,11 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
         characteristics.first { $0.id.uuidString == "0031" }
     }
 
+    /// Display brightness (5-100%).
+    public var brightnessEntry: CharacteristicEntry? {
+        characteristics.first { $0.id.uuidString == "0025" }
+    }
+
     /// Eye-sync group (0 = off) and role (0 = left/leader, 1 = right).
     public var syncGroupEntry: CharacteristicEntry? {
         characteristics.first { $0.id.uuidString == "0032" }
@@ -124,7 +129,7 @@ public class EyeballDevice: ObservableObject, Identifiable, Hashable {
     /// the firmware re-exposes mode-specific params.
     public var variantParameters: [CharacteristicEntry] {
         parameters.filter {
-            !["0001", "0010", "0031", "0032", "0033", "0040"]
+            !["0001", "0010", "0025", "0031", "0032", "0033", "0034", "0040"]
                 .contains($0.id.uuidString)
         }
     }

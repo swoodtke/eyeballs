@@ -62,6 +62,11 @@ struct DeviceDashboardView: View {
                     }
                 }
 
+                if let brightness = device.brightnessEntry {
+                    BrightnessRow(entry: brightness, device: device)
+                        .environmentObject(bluetooth)
+                }
+
                 if let rotation = device.rotationEntry {
                     RotationRow(entry: rotation, device: device)
                         .environmentObject(bluetooth)
@@ -147,6 +152,33 @@ struct DeviceDashboardView: View {
         guard !trimmed.isEmpty else { return }
         bluetooth.writeDeviceName(trimmed, on: device)
         editingName = false
+    }
+}
+
+/// Display brightness slider (10-100% in steps of 10; the firmware
+/// refuses fully dark).
+private struct BrightnessRow: View {
+    @ObservedObject var entry: CharacteristicEntry
+    @ObservedObject var device: EyeballDevice
+    @EnvironmentObject var bluetooth: BluetoothManager
+
+    var body: some View {
+        HStack {
+            Text("Brightness")
+            Slider(value: Binding(
+                get: { Double(entry.uint8Value ?? 100) },
+                set: { newVal in
+                    let stepped = UInt8(clamping: Int((newVal / 10).rounded()) * 10)
+                    guard stepped != entry.uint8Value else { return }
+                    bluetooth.writeUInt8(stepped, to: entry, on: device)
+                    entry.value = Data([stepped])
+                }
+            ), in: 10...100, step: 10)
+            Text("\(entry.uint8Value ?? 100)%")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 48, alignment: .trailing)
+        }
     }
 }
 

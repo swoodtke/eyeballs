@@ -114,6 +114,20 @@ public class BluetoothManager: NSObject, ObservableObject {
         write(data: data, to: entry, on: device)
     }
 
+    public func writeUInt32(_ value: UInt32, to entry: CharacteristicEntry, on device: EyeballDevice) {
+        let data = withUnsafeBytes(of: value.littleEndian) { Data($0) }
+        write(data: data, to: entry, on: device)
+    }
+
+    /// Devices have no idea what time it is until someone tells them —
+    /// write local wall time whenever the clock characteristic appears.
+    fileprivate func autoSetClock(_ entry: CharacteristicEntry, on device: EyeballDevice) {
+        let c = Calendar.current.dateComponents([.hour, .minute, .second], from: Date())
+        let secs = UInt32((c.hour ?? 0) * 3600 + (c.minute ?? 0) * 60 + (c.second ?? 0))
+        writeUInt32(secs, to: entry, on: device)
+        entry.value = withUnsafeBytes(of: secs.littleEndian) { Data($0) }
+    }
+
     public func writeDeviceName(_ name: String, on device: EyeballDevice) {
         guard let entry = device.deviceNameEntry,
               let data = name.data(using: .utf8),
@@ -230,6 +244,11 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
                 device.characteristics.append(entry)
                 // Re-sort: device name first, then params, then stats
                 device.characteristics.sort { $0.id.uuidString < $1.id.uuidString }
+                // Sync wall time once per connection, as soon as the clock
+                // characteristic is discovered
+                if characteristic.uuid.uuidString == "0034" {
+                    manager?.autoSetClock(entry, on: device)
+                }
             }
             // The name characteristic is authoritative — advertisement
             // names can be stale
@@ -249,10 +268,12 @@ private class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         case "0010": return "Display Mode"
         case "0022": return "Battery V"
         case "0023": return "Battery %"
+        case "0025": return "Brightness"
         case "0030": return "Firmware"
         case "0031": return "Rotation"
         case "0032": return "Sync Group"
         case "0033": return "Sync Role"
+        case "0034": return "Clock"
         case "0040": return "Sync Data"
         default: return "Unknown (\(uuid.uuidString))"
         }

@@ -42,6 +42,7 @@
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "driver/ledc.h"
 #include "eyesync.h"
 
 static const char *TAG = "eye";
@@ -60,8 +61,8 @@ static int lcd_pixels;  // board->lcd_w * board->lcd_h, set once
 #define EXIO_LCD_RST   (1 << 2)   // EXIO2
 
 typedef enum { MODE_CAT_EYE, MODE_HYPNOTOAD, MODE_SAURON,
-               MODE_SPIRAL_RINGS, MODE_HEART } display_mode_t;
-#define NUM_MODES 5
+               MODE_SPIRAL_RINGS, MODE_HEART, MODE_CLOCK } display_mode_t;
+#define NUM_MODES 6
 static display_mode_t display_mode = MODE_CAT_EYE;
 // Long-press status overlay (Core 0 owns; render sees it via render_params)
 static bool status_screen_on = false;
@@ -77,11 +78,22 @@ static char fw_version[24];
 static uint8_t display_rotation = 0;
 static uint8_t ble_rotation = 0;
 
-// Eye-to-eye sync (ESP-NOW): group 0 = disabled, role 0 = left/leader
+// Eye-to-eye sync: group 0 = disabled, role 0 = left/leader
 static uint8_t sync_group = 0;
 static uint8_t sync_role = 0;
-static uint8_t display_brightness = 100;  // 0-100%, only used on CO5300 (1.75" board)
+
+// Wall-clock time for the clock mode: local midnight expressed in the
+// esp_timer timebase — legitimately NEGATIVE whenever the device booted
+// after midnight (esp_timer starts at 0 at boot), hence the separate
+// validity flag. Set over BLE (the app writes local seconds-since-midnight
+// on every connect) and seeded from the PCF85063 hardware RTC at boot
+// (both boards carry one; probed at runtime).
+static int64_t clock_midnight_us = 0;
+static bool clock_valid = false;
+static uint32_t ble_clock = 0xFFFFFFFF;   // BLE-visible: local secs since midnight
+static uint8_t display_brightness = 100;  // 0-100%, persisted, set over BLE
 static uint8_t prev_brightness = 100;
+static esp_lcd_panel_io_handle_t lcd_io;  // kept for raw DCS commands (0x51)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Framebuffer  (double-buffered in PSRAM, sized at runtime from board config)
@@ -388,7 +400,7 @@ static void lcd_init(void)
     }
 
     // Create QSPI panel IO
-    esp_lcd_panel_io_handle_t io_handle;
+    esp_lcd_panel_io_handle_t io_handle;   // stored into lcd_io below
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num        = -1,
         .cs_gpio_num        = board->pin_lcd_cs,
@@ -422,6 +434,7 @@ static void lcd_init(void)
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
                                               &io_config, &io_handle));
+    lcd_io = io_handle;
 
     if (board->use_spd2010) {
         // ── SPD2010 (1.46") ──
@@ -457,8 +470,29 @@ static void lcd_init(void)
         esp_lcd_panel_set_gap(panel, board->x_gap, board->y_gap);
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
-    if (board->has_backlight_gpio)
-        gpio_set_level(board->pin_lcd_bl, 1);
+    if (board->has_backlight_gpio) {
+        // Brightness on the 1.46" is a hardware pin (GPIO5 → LCD_BL):
+        // drive it with LEDC PWM. 20 kHz is above audible and flicker-free.
+        // Duty starts at 0; display_apply_brightness() raises it to the
+        // persisted level moments later in app_main.
+        ledc_timer_config_t tcfg = {
+            .speed_mode      = LEDC_LOW_SPEED_MODE,
+            .duty_resolution = LEDC_TIMER_10_BIT,
+            .timer_num       = LEDC_TIMER_0,
+            .freq_hz         = 20000,
+            .clk_cfg         = LEDC_AUTO_CLK,
+        };
+        ESP_ERROR_CHECK(ledc_timer_config(&tcfg));
+        ledc_channel_config_t ccfg = {
+            .gpio_num   = board->pin_lcd_bl,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel    = LEDC_CHANNEL_0,
+            .timer_sel  = LEDC_TIMER_0,
+            .duty       = 0,
+            .hpoint     = 0,
+        };
+        ESP_ERROR_CHECK(ledc_channel_config(&ccfg));
+    }
 
     ESP_LOGI(TAG, "Display ready (%s)", board->name);
 }
@@ -739,6 +773,27 @@ static void lcd_flush(void)
 // NOTE: 90°/270° need the controller's row/column-exchange support; the
 // log below reports the driver's verdict per panel.
 // ─────────────────────────────────────────────────────────────────────────────
+/** Apply display brightness (10-100%). The 1.75" CO5300 has a brightness
+ *  command; the 1.46" panel is dimmed via PWM on its LCD_BL pin. */
+static void display_apply_brightness(void)
+{
+    uint8_t pct = display_brightness;
+    if (pct < 10) pct = 10;     // never fully dark — the UI must stay usable
+    if (pct > 100) pct = 100;
+
+    if (board->has_backlight_gpio) {
+        // 1.46": hardware brightness pin, PWM duty. The square-law curve
+        // makes the 10% slider steps read as roughly even to the eye.
+        uint32_t duty = (uint32_t)pct * pct * 1023 / 10000;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    } else {
+        // 1.75": CO5300 brightness command
+        esp_lcd_panel_co5300_set_brightness(panel, pct);
+    }
+    prev_brightness = display_brightness;
+}
+
 static void apply_rotation(void)
 {
     // All rotation happens at render time; the panel is never touched.
@@ -772,9 +827,59 @@ static void settings_load(void)
             sync_group = v;
         if (nvs_get_u8(h, "sync_role", &v) == ESP_OK)
             sync_role = v & 1;
+        if (nvs_get_u8(h, "brightness", &v) == ESP_OK && v >= 10 && v <= 100)
+            display_brightness = v;
         nvs_close(h);
     }
     ble_rotation = display_rotation;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PCF85063/PCF85063A hardware RTC — both boards carry one (probed at
+// runtime); keeps wall time across power cycles while battery-backed.
+// ─────────────────────────────────────────────────────────────────────────────
+#define PCF85063_ADDR  0x51
+#define PCF85063_SEC   0x04   // BCD, bit7 = OS (oscillator stopped, time invalid)
+#define PCF85063_MIN   0x05   // BCD
+#define PCF85063_HOUR  0x06   // BCD, 24h
+
+static bool rtc_available = false;
+
+static inline uint8_t bcd2bin(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+static inline uint8_t bin2bcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+
+static void rtc_init_and_seed(void)
+{
+    uint8_t sec = 0;
+    if (i2c_read_reg(PCF85063_ADDR, PCF85063_SEC, &sec, 1) != ESP_OK) {
+        ESP_LOGI(TAG, "PCF85063 RTC not present");
+        return;
+    }
+    rtc_available = true;
+    if (sec & 0x80) {
+        ESP_LOGW(TAG, "PCF85063: oscillator was stopped — time invalid until set");
+        return;
+    }
+    uint8_t min = 0, hour = 0;
+    i2c_read_reg(PCF85063_ADDR, PCF85063_MIN, &min, 1);
+    i2c_read_reg(PCF85063_ADDR, PCF85063_HOUR, &hour, 1);
+    uint32_t secs = (uint32_t)bcd2bin(hour & 0x3F) * 3600 +
+                    (uint32_t)bcd2bin(min & 0x7F) * 60 +
+                    bcd2bin(sec & 0x7F);
+    clock_midnight_us = esp_timer_get_time() - (int64_t)secs * 1000000;
+    clock_valid = true;
+    ESP_LOGI(TAG, "PCF85063: time %02u:%02u:%02u restored",
+             (unsigned)(secs / 3600), (unsigned)(secs / 60 % 60), (unsigned)(secs % 60));
+}
+
+static void rtc_store(uint32_t secs_since_midnight)
+{
+    if (!rtc_available) return;
+    uint32_t s = secs_since_midnight % 86400;
+    // Writing the seconds register also clears the OS (invalid) flag
+    i2c_write_reg(PCF85063_ADDR, PCF85063_SEC,  bin2bcd(s % 60));
+    i2c_write_reg(PCF85063_ADDR, PCF85063_MIN,  bin2bcd(s / 60 % 60));
+    i2c_write_reg(PCF85063_ADDR, PCF85063_HOUR, bin2bcd(s / 3600));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2020,11 +2125,13 @@ static const char *mode_name(display_mode_t m) {
         case MODE_SAURON:       return "SAURON";
         case MODE_SPIRAL_RINGS: return "SPIRAL_RINGS";
         case MODE_HEART:        return "HEART";
+        case MODE_CLOCK:        return "CLOCK";
         default:             return "UNKNOWN";
     }
 }
 
 static void draw_status_screen(void);   // defined after the battery section
+static void eye_draw_clock(void);       // defined alongside it
 
 static display_mode_t active_mode = MODE_CAT_EYE;
 
@@ -2039,6 +2146,7 @@ static void eye_mode_switch(display_mode_t new_mode)
         case MODE_SAURON:
         case MODE_SPIRAL_RINGS:
         case MODE_HEART:        anim_free(); break;
+        case MODE_CLOCK:        break;   // no resources
     }
 
     // Init new mode resources
@@ -2048,6 +2156,7 @@ static void eye_mode_switch(display_mode_t new_mode)
         case MODE_SAURON:       anim_init("sauron"); break;
         case MODE_SPIRAL_RINGS: anim_init("spiral"); break;
         case MODE_HEART:        anim_init("heart"); break;
+        case MODE_CLOCK:        break;   // no resources
     }
 
     active_mode = new_mode;
@@ -2086,6 +2195,8 @@ static void eye_draw(void)
     else if (display_mode == MODE_SPIRAL_RINGS ||
              display_mode == MODE_HEART)
         eye_draw_anim();
+    else if (display_mode == MODE_CLOCK)
+        eye_draw_clock();
     else
         eye_draw_cat();
 }
@@ -2335,12 +2446,16 @@ static void draw_char8(int x0, int y0, char c, int scale, uint16_t col)
     }
 }
 
+static void draw_text_at(int x, int y, const char *s, int scale, uint16_t col)
+{
+    for (int i = 0; s[i]; i++, x += 8 * scale)
+        draw_char8(x, y, s[i], scale, col);
+}
+
 static void draw_text_centered(int y, const char *s, int scale, uint16_t col)
 {
     int len = (int)strlen(s);
-    int x = (board->lcd_w - len * 8 * scale) / 2;
-    for (int i = 0; i < len; i++, x += 8 * scale)
-        draw_char8(x, y, s[i], scale, col);
+    draw_text_at((board->lcd_w - len * 8 * scale) / 2, y, s, scale, col);
 }
 
 static void draw_status_screen(void)
@@ -2386,6 +2501,92 @@ static void draw_status_screen(void)
 
     snprintf(line, sizeof(line), "FW %s", fw_version);
     draw_text_centered(y, line, 2, col_dim);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Clock mode — analog face: Roman numerals at 12/3/6/9, hour/minute hands,
+// sweeping red second hand
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Draw a clock hand: a thick line from the center outward at `angle`
+ *  radians (0 = 12 o'clock, clockwise), respecting display rotation. */
+static void draw_hand(float angle, float r_len, int half_w, uint16_t col)
+{
+    const int W = board->lcd_w, H = board->lcd_h;
+    const int CX = board->eye_cx, CY = board->eye_cy;
+    angle += (float)render_params.rotation * (float)M_PI_2;
+    float dx = sinf(angle), dy = -cosf(angle);
+
+    int steps = (int)r_len;
+    for (int i = 0; i <= steps; i++) {
+        int px = CX + (int)(dx * i);
+        int py = CY + (int)(dy * i);
+        for (int oy = -half_w; oy <= half_w; oy++) {
+            int y = py + oy;
+            if ((unsigned)y >= (unsigned)H) continue;
+            uint16_t *row = draw_fb + y * W;
+            for (int ox = -half_w; ox <= half_w; ox++) {
+                int x = px + ox;
+                if ((unsigned)x < (unsigned)W) row[x] = col;
+            }
+        }
+    }
+}
+
+static void eye_draw_clock(void)
+{
+    const int CX = board->eye_cx, CY = board->eye_cy;
+    const int SR = board->sclera_r;
+    memset(draw_fb, 0, lcd_pixels * sizeof(uint16_t));
+
+    const uint16_t col_num  = rgb(220, 220, 230);
+    const uint16_t col_hand = rgb(240, 240, 246);
+    const uint16_t col_sec  = rgb(230, 40, 40);
+
+    // Roman numerals at 12/3/6/9, centered on a ring inside the bezel.
+    // Positions are logical (viewer) coords; draw_char8 rotates them.
+    const int scale = 3;
+    const int R = SR - 34;
+    static const struct { const char *s; int px, py; } nums[4] = {
+        { "XII",  0, -1 }, { "III",  1, 0 }, { "VI",  0, 1 }, { "IX", -1, 0 },
+    };
+    for (int i = 0; i < 4; i++) {
+        int len = (int)strlen(nums[i].s);
+        int px = CX + nums[i].px * R - len * 8 * scale / 2;
+        int py = CY + nums[i].py * R - 4 * scale;
+        draw_text_at(px, py, nums[i].s, scale, col_num);
+    }
+
+    // Hands from wall time; sweep the second hand smoothly
+    if (clock_valid) {
+        int64_t us = esp_timer_get_time() - clock_midnight_us;
+        float secs = (float)((double)(us % 86400000000LL) / 1e6);
+        float m = fmodf(secs / 60.0f, 60.0f);
+        float h = fmodf(secs / 3600.0f, 12.0f);
+
+        // Quartz-style tick: rest on each second, snap to the next over
+        // ~150 ms with a slight overshoot that settles (ease-out-back)
+        float whole = floorf(fmodf(secs, 60.0f));
+        float frac  = fmodf(secs, 1.0f);
+        const float TICK = 0.15f;
+        float s;
+        if (frac < TICK) {
+            float t = frac / TICK - 1.0f;          // -1 → 0
+            const float k = 1.4f;                  // overshoot amount
+            float ease = 1.0f + (k + 1.0f) * t * t * t + k * t * t;
+            s = (whole - 1.0f) + ease;
+        } else {
+            s = whole;
+        }
+
+        draw_hand(h * (2 * M_PI / 12), SR * 0.52f, 4, col_hand);
+        draw_hand(m * (2 * M_PI / 60), SR * 0.78f, 3, col_hand);
+        draw_hand(s * (2 * M_PI / 60), SR * 0.86f, 1, col_sec);
+    } else {
+        draw_text_centered(CY + SR / 2, "SET CLOCK", 2, rgb(150, 150, 150));
+    }
+
+    draw_circle(CX, CY, 8, col_hand);   // center hub
 }
 
 static void battery_read_voltage(void)
@@ -2454,6 +2655,8 @@ void app_main(void)
     }
     settings_load();
     if (display_rotation != 0) apply_rotation();
+    display_apply_brightness();
+    rtc_init_and_seed();
 
     te_init();
     touch_init();
@@ -2475,12 +2678,14 @@ void app_main(void)
         { 0x0010, "Display Mode",  BLE_PARAM_RWN,  &ble_display_mode,  1 },
         { 0x0022, "Battery V",     BLE_PARAM_STAT, &battery_voltage,   4 },
         { 0x0023, "Battery %",     BLE_PARAM_STAT, &battery_percent,   4 },
+        { 0x0025, "Brightness",    BLE_PARAM_RWN,  &display_brightness, 1 },
         { 0x0030, "FW Version",    BLE_PARAM_F_READ, fw_version,      20 },
         { 0x0031, "Rotation",      BLE_PARAM_RWN,  &ble_rotation,      1 },
         { 0x0032, "Sync Group",    BLE_PARAM_RWN,  &sync_group,        1 },
         { 0x0033, "Sync Role",     BLE_PARAM_RWN,  &sync_role,         1 },
         { EYESYNC_CHR_UUID, "Sync Data", BLE_PARAM_RWN, eyesync_gatt_buf,
           EYESYNC_PKT_LEN },
+        { 0x0034, "Clock",         BLE_PARAM_RW,   &ble_clock,         4 },
     };
     ble_init(ble_params, sizeof(ble_params) / sizeof(ble_params[0]));
 
@@ -2713,6 +2918,21 @@ void app_main(void)
         // Leader broadcasts mode + animation clock at 5 Hz
         eyesync_beacon((uint8_t)display_mode, anim_position_ms());
 
+        // Wall-clock set over BLE: rebase our reference and store to the RTC
+        {
+            static uint32_t applied_clock = 0xFFFFFFFF;
+            if (ble_clock != applied_clock && ble_clock != 0xFFFFFFFF) {
+                applied_clock = ble_clock % 86400;
+                clock_midnight_us = now_us - (int64_t)applied_clock * 1000000;
+                clock_valid = true;
+                rtc_store(applied_clock);
+                ESP_LOGI(TAG, "Clock set to %02u:%02u:%02u",
+                         (unsigned)(applied_clock / 3600),
+                         (unsigned)(applied_clock / 60 % 60),
+                         (unsigned)(applied_clock % 60));
+            }
+        }
+
         render_params.px           = eye.px;
         render_params.py           = eye.py;
         render_params.rpx          = eye.rpx;
@@ -2734,10 +2954,10 @@ void app_main(void)
         // Start Core 1 rendering into back buffer
         xSemaphoreGive(flush_done_sem);
 
-        // Apply brightness if changed via BLE (CO5300 only)
-        if (display_brightness != prev_brightness && !board->has_backlight_gpio) {
-            esp_lcd_panel_co5300_set_brightness(panel, display_brightness);
-            prev_brightness = display_brightness;
+        // Apply + persist brightness when changed via BLE (both panels)
+        if (display_brightness != prev_brightness) {
+            display_apply_brightness();
+            settings_save_u8("brightness", display_brightness);
         }
 
         int64_t t1 = esp_timer_get_time();

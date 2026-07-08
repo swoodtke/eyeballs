@@ -262,6 +262,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 }
             }
             ESP_LOGI(TAG, "Connected (handle=%d)", event->connect.conn_handle);
+            // First boot on new firmware: tell every client that connects
+            // to drop its cached GATT table — the boot-time indication only
+            // reaches peers that were already connected (i.e., nobody)
+            if (s_svc_changed_pending)
+                ble_svc_gatt_changed(0x0001, 0xffff);
         } else {
             ESP_LOGW(TAG, "Connection failed: %d", event->connect.status);
         }
@@ -291,6 +296,16 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "Encryption %s (handle=%d status=%d)",
                  event->enc_change.status == 0 ? "enabled" : "failed",
                  event->enc_change.conn_handle, event->enc_change.status);
+        if (event->enc_change.status != 0) {
+            // Stale bond (peer kept a key we no longer have, or vice
+            // versa): drop our copy and start a fresh Just Works pairing
+            // instead of letting the peer retry-and-fail forever
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
+                ble_store_util_delete_peer(&desc.peer_id_addr);
+                ble_gap_security_initiate(event->enc_change.conn_handle);
+            }
+        }
         break;
 
     case BLE_GAP_EVENT_REPEAT_PAIRING: {

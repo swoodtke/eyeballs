@@ -10,7 +10,8 @@ struct ModeListView: View {
     @EnvironmentObject var bluetooth: BluetoothManager
 
     // Must match the firmware's display_mode_t order
-    static let modeNames = ["Cat Eye", "Hypnotoad", "Sauron", "Spiral Rings", "Heart"]
+    static let modeNames = ["Cat Eye", "Hypnotoad", "Sauron", "Spiral Rings",
+                            "Heart", "Clock"]
 
     var body: some View {
         let current = Int(entry.uint8Value ?? 0)
